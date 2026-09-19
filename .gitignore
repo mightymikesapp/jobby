@@ -1,0 +1,57 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.venv/
+.venv-release/
+.venv-root/
+.venv-py312/
+.venv-py314/
+node_modules/
+build/
+dist/
+*.egg-info/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.DS_Store
+
+# Local/private job-search material. These files stay on disk but are never
+# part of the source repository.
+.playwright-mcp/
+.env
+.env.*
+/config/
+/data/
+/hawaii-ag-applications/
+/interview-prep/
+/jds/
+/modes/
+/output/
+/reports/
+/private/
+/templates/
+/CLAUDE.md
+/AI_Company_*.md
+/Career Opportunities Report.pdf
+/Cover Letter - *.md
+/Cover Letter - *.docx
+/Cover Letter - *.pdf
+/Follow-up - *.md
+/Job Search Tracker - *.md
+/Legal_Tech_Job_Search_Results_*.md
+/Master_Job_Search_Compendium_*.md
+/Mike Sapp Resume 2026.*
+/Mike_Sapp_*.md
+/Patent Portfolio Licensing Model *.md
+/SEC Legal Research Analyst - Application Prep.md
+/Secure_AI_Project_*.md
+/The Rage Machine non-anon.docx
+/YAHNY.docx
+/sapp-*.pdf
+/transcript.pdf
+/Unofficial undergrad Student Transcript.pdf
+/new_jobs_*.md
+/job_monitor_state.json*
+/portals.yml

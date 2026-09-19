@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=75,<84", "wheel>=0.45,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobby"
+version = "0.6.0"
+description = "Local-first, headless personal job-search operating system"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "LicenseRef-Proprietary"
+authors = [{ name = "Mike Sapp" }]
+keywords = ["jobs", "local-first", "sqlite", "cli", "mcp"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "alembic>=1.15,<2",
+  "cryptography>=50,<51",
+  # Static portal extraction subclasses httpcore's sync backend to pin DNS at
+  # connect time. Keep this internal API exact until that hook is public.
+  "httpcore==1.0.9",
+  "httpx>=0.28,<1",
+  "keyring>=25.6,<26",
+  "openai>=2.26,<3",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.10,<3",
+  "pypdf>=6.16.1,<7",
+  "python-docx>=1.1,<2",
+  "PyYAML>=6.0,<7",
+  "reportlab>=4.2,<6",
+  "SQLAlchemy>=2.0.36,<3",
+  "tomli-w>=1.2,<2",
+]
+
+[project.optional-dependencies]
+google = [
+  "google-api-python-client>=2.160,<3",
+  "google-auth>=2.38,<3",
+  "google-auth-oauthlib>=1.2,<2",
+]
+mcp = [
+  "mcp>=1.0,<2",
+]
+release = [
+  "build>=1.2,<2",
+  "pyinstaller==6.21.0",
+  "pyinstaller-hooks-contrib==2026.6",
+  "setuptools>=75,<84",
+  "wheel>=0.45,<1",
+]
+test = [
+  "hypothesis>=6.100,<7",
+  "mcp>=1.0,<2",
+  "pytest>=8.0,<10",
+  "pytest-asyncio>=0.25,<2",
+  "requests>=2.32,<3",
+  "respx>=0.22,<1",
+]
+
+[project.scripts]
+jobby = "jobby.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+jobby = [
+  "migrations/README",
+  "migrations/*.json",
+  "migrations/env.py",
+  "migrations/script.py.mako",
+  "migrations/versions/*.py",
+]
+
+[tool.setuptools.data-files]
+"share/doc/jobby" = ["THIRD_PARTY_NOTICES.md"]
+
+[tool.uv]
+required-version = ">=0.9.8,<0.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "scale: opt-in exact 100k-job/10k-application/1m-source-update release gate",
+]

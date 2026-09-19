@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+        python: ["3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Sync locked dependencies
+        run: |
+          uv lock --check
+          uv sync --frozen --all-extras --python "${{ matrix.python }}"
+      - name: Run tests
+        run: .venv/bin/python -m pytest -q
+        env:
+          JOBBY_TEST_OFFLINE: "1"
+          PYTHONPATH: ${{ github.workspace }}/tests/offline_support
+
+  quality:
+    timeout-minutes: 20
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: "3.13"
+          enable-cache: true
+      - name: Sync locked dependencies
+        run: uv sync --frozen --all-extras --python 3.13
+      - name: Check formatting
+        run: uvx --from ruff==0.15.21 ruff format --check src tests scripts
+      - name: Check lint
+        run: uvx --from ruff==0.15.21 ruff check src tests scripts
+      - name: Check types
+        run: uvx --from ty==0.0.59 ty check src/jobby
+      - name: Audit dependencies
+        run: |
+          uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes --output "$RUNNER_TEMP/jobby-requirements.txt"
+          uvx --from pip-audit==2.10.1 pip-audit --requirement "$RUNNER_TEMP/jobby-requirements.txt"
+      - name: Audit application security
+        run: uvx --from bandit==1.9.4 bandit -q -ll -r src/jobby scripts
+      - name: Verify source-only Git policy
+        run: |
+          forbidden='\.(docx|pdf)$|(^|/)(config|data|jds|output|reports|templates|private)/'
+          if git ls-files | grep -E "$forbidden"; then
+            echo "Private artifacts are tracked" >&2
+            exit 1
+          fi
+

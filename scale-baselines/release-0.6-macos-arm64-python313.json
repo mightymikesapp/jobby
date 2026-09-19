@@ -1,0 +1,56 @@
+{
+  "schema": "jobby-scale-gate-v1",
+  "generated_at": "2026-07-14T09:21:58.145812+00:00",
+  "profile": {
+    "name": "release-0.6",
+    "jobs": 100000,
+    "applications": 10000,
+    "source_state_updates": 1000000,
+    "page_size": 100
+  },
+  "runtime": {
+    "python": "3.13.14",
+    "implementation": "CPython",
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "sqlite": "3.53.1"
+  },
+  "operations": {
+    "insert_jobs": {
+      "elapsed_seconds": 16.48428341699764,
+      "peak_python_bytes": 5644091
+    },
+    "insert_applications": {
+      "elapsed_seconds": 0.7574192921165377
+    },
+    "insert_source_states": {
+      "elapsed_seconds": 7.341104540973902
+    },
+    "source_state_updates": {
+      "elapsed_seconds": 8.141445375047624
+    },
+    "job_page_first": {
+      "elapsed_ms": 201.8890418112278
+    },
+    "job_page_tail": {
+      "elapsed_ms": 222.54183306358755
+    },
+    "ranked_page_first": {
+      "elapsed_ms": 48.264458077028394
+    },
+    "ranked_page_tail": {
+      "elapsed_ms": 179.23058290034533
+    },
+    "streaming_csv_export": {
+      "elapsed_seconds": 11.228055083891377,
+      "peak_python_bytes": 2468250
+    }
+  },
+  "storage": {
+    "after_export": {
+      "total_bytes": 169713664
+    }
+  },
+  "derived": {
+    "source_update_growth_bytes": 12288
+  }
+}

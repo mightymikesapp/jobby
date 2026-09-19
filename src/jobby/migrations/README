@@ -1,0 +1,3 @@
+Jobby's database migrations. Runtime initialization and Alembic share the same
+SQLAlchemy metadata; release upgrades use ``alembic upgrade head``.
+

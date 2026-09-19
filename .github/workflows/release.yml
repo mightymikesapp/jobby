@@ -1,0 +1,114 @@
+name: release-builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Personal V1 ships Apple Silicon macOS plus a conservative glibc
+        # baseline for the portable Linux build.
+        os: [macos-15, ubuntu-22.04]
+        python: ["3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Sync locked dependencies
+        run: |
+          uv lock --check
+          uv sync --frozen --all-extras --python "${{ matrix.python }}"
+      - name: Validate release tag
+        if: github.ref_type == 'tag'
+        run: .venv/bin/python scripts/release_tools.py check-tag "${GITHUB_REF_NAME}"
+      - name: Run offline tests
+        run: .venv/bin/python -m pytest -q
+        env:
+          JOBBY_TEST_OFFLINE: "1"
+          PYTHONPATH: ${{ github.workspace }}/tests/offline_support
+      - name: Run exact macOS arm64 Python 3.13 scale baseline
+        if: matrix.os == 'macos-15' && matrix.python == '3.13'
+        run: |
+          if [[ "$(uname -m)" != "arm64" ]]; then
+            echo "Exact scale baseline requires an arm64 runner" >&2
+            exit 1
+          fi
+          .venv/bin/python scripts/scale_gate.py \
+            --profile release \
+            --confirm-exact-scale \
+            --work-dir "${RUNNER_TEMP}/jobby-exact-scale" \
+            --output "${RUNNER_TEMP}/jobby-exact-scale-report.json" \
+            --baseline scale-baselines/release-0.6-macos-arm64-python313.json \
+            --max-regression-percent 25
+        env:
+          JOBBY_TEST_OFFLINE: "1"
+          PYTHONPATH: ${{ github.workspace }}/tests/offline_support
+      - name: Retain exact scale report
+        if: always() && matrix.os == 'macos-15' && matrix.python == '3.13'
+        uses: actions/upload-artifact@v7
+        with:
+          name: jobby-exact-scale-macos-arm64-python313
+          if-no-files-found: error
+          retention-days: 14
+          path: ${{ runner.temp }}/jobby-exact-scale-report.json
+      - name: Check formatting and lint
+        run: |
+          uvx --from ruff==0.15.21 ruff format --check src tests scripts
+          uvx --from ruff==0.15.21 ruff check src tests scripts
+      - name: Audit dependencies and application security
+        if: matrix.os == 'ubuntu-22.04' && matrix.python == '3.13'
+        run: |
+          uv export --frozen --all-extras --no-dev --no-emit-project --no-hashes --output-file "${RUNNER_TEMP}/jobby-requirements.txt"
+          uvx --from pip-audit==2.10.1 pip-audit --requirement "${RUNNER_TEMP}/jobby-requirements.txt"
+          uvx --from bandit==1.9.4 bandit -q -ll -r src/jobby scripts
+          uvx --from ty==0.0.59 ty check src/jobby
+      - if: matrix.python == '3.13'
+        run: .venv/bin/python -m build --wheel --no-isolation --outdir dist
+        env:
+          SOURCE_DATE_EPOCH: "315619200"
+      - if: matrix.python == '3.13'
+        run: .venv/bin/python -m PyInstaller --noconfirm --clean jobby.spec
+        env:
+          SOURCE_DATE_EPOCH: "315619200"
+      - if: matrix.python == '3.13'
+        id: package
+        name: Package and verify frozen release
+        run: |
+          version="$(.venv/bin/python scripts/release_tools.py version)"
+          archive="dist/jobby-${version}-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
+          tar -czf "$archive" -C dist jobby
+          mkdir -p "${RUNNER_TEMP}/jobby-release"
+          tar -xzf "$archive" -C "${RUNNER_TEMP}/jobby-release"
+          wheel="$(find dist -maxdepth 1 -type f -name "jobby-${version}-*.whl" -print -quit)"
+          .venv/bin/python scripts/release_tools.py checksums \
+            --output dist/SHA256SUMS "$archive" "$wheel"
+          .venv/bin/python scripts/release_tools.py verify \
+            --bundle "${RUNNER_TEMP}/jobby-release/jobby" \
+            --archive "$archive" \
+            --checksums dist/SHA256SUMS \
+            --expected-version "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - if: matrix.python == '3.13'
+        uses: actions/upload-artifact@v7
+        with:
+          name: jobby-${{ steps.package.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+          path: |
+            dist/jobby-*.tar.gz
+            dist/*.whl
+            dist/SHA256SUMS
