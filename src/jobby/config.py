@@ -502,6 +502,19 @@ class AppConfig(BaseModel):
     ranking_target_seniority: Literal["any", "early", "mid", "senior"] = "any"
     # Title terms for unwanted role families (e.g. "software engineer"); they
     # cap fit unless the title also names a target role family.
+    # Bar status: "not_admitted" fails bar-required roles and roles asking for
+    # 3+ years of legal experience; "admitted" passes bar requirements in
+    # ranking_bar_jurisdictions (any jurisdiction when empty). Approved
+    # current-admission profile facts take precedence.
+    ranking_bar_status: Literal["unknown", "not_admitted", "admitted"] = "unknown"
+    ranking_bar_jurisdictions: list[
+        Annotated[
+            str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+        ]
+    ] = Field(default_factory=list, max_length=60)
+    # Move roles with an unmet bar or legal-experience requirement to ignored,
+    # the way unpaid roles are; they reopen when the status changes.
+    ranking_skip_credential_gaps: bool = False
     ranking_excluded_title_terms: list[
         Annotated[
             str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)

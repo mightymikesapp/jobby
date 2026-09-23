@@ -411,7 +411,8 @@ class NormalizedSalary:
 
 
 _NUMBER_RE = re.compile(
-    r"(?<![\w])(-?[0-9][0-9,]*(?:\.[0-9]+)?)\s*([km])?", re.IGNORECASE
+    r"(?<![\w])(-?[0-9][0-9,]*(?:\.[0-9]+)?)(?:\s?([km])(?:illion)?(?![a-z]))?",
+    re.IGNORECASE,
 )
 
 
@@ -535,7 +536,7 @@ def _salary_period(value: object) -> SalaryPeriod:
         return SalaryPeriod.WEEK
     if re.search(r"\b(month|monthly)\b", text):
         return SalaryPeriod.MONTH
-    if re.search(r"\b(year|yearly|annual|annually|annum)\b", text):
+    if re.search(r"\b(year|yearly|yr|annual|annually|annum)\b", text):
         return SalaryPeriod.YEAR
     return SalaryPeriod.UNKNOWN
 
@@ -682,14 +683,64 @@ _MONEY_RANGE_RE = re.compile(
     r"MXN|BRL|ZAR|SEK|NOK|DKK|PLN)\s*(?:[$£€])?|"
     r"(?:US|C|CA|A|AU)?[$£€])"
     r")\s*"
-    r"(?P<low>[0-9][0-9,]*(?:\.[0-9]+)?\s*[kKmM]?)"
+    r"(?P<low>[0-9][0-9,]*(?:\.[0-9]+)?(?:\s?[kKmM](?:illion)?(?![A-Za-z]))?)"
     r"(?:\s*(?:-|\u2013|\u2014|to)\s*"
     r"(?:(?:(?:USD|CAD|AUD|EUR|GBP|JPY|CHF|NZD|CNY|RMB|INR|KRW|SGD|HKD|"
     r"MXN|BRL|ZAR|SEK|NOK|DKK|PLN)\s*(?:[$£€])?|"
     r"(?:US|C|CA|A|AU)?[$£€])\s*)?"
-    r"(?P<high>[0-9][0-9,]*(?:\.[0-9]+)?\s*[kKmM]?))?",
+    r"(?P<high>[0-9][0-9,]*(?:\.[0-9]+)?(?:\s?[kKmM](?:illion)?(?![A-Za-z]))?))?",
     re.IGNORECASE,
 )
+
+
+# The pay period must be stated next to the amount. A period word elsewhere in
+# the passage ("sick days", "a 90-day waiting period") says nothing about pay.
+_PERIOD_AFTER_RE = re.compile(
+    r"^\s*(?:[A-Z]{3}\b\s*)?(?:(?:per|an?|/|each)\s*(?P<unit>hour|hr|day|week|month|"
+    r"year|yr|annum)\b|(?P<adverb>hourly|daily|weekly|monthly|annually|yearly|annual))",
+    re.IGNORECASE,
+)
+_PERIOD_BEFORE_RE = re.compile(
+    r"\b(?P<adjective>hourly|daily|weekly|monthly|annual|annualized|yearly)\s+"
+    r"(?:base\s+)?(?:salary|pay|rate|wage|compensation)\b[^$£€0-9]{0,60}$|"
+    r"\b(?:salary|pay|rate|wage|compensation)\s+per\s+(?P<unit>hour|day|week|month|"
+    r"year|annum)\b[^$£€0-9]{0,60}$",
+    re.IGNORECASE,
+)
+# A lone amount needs a pay word right before it; budgets and revenue are money
+# but not compensation.
+_PAY_CONTEXT_RE = re.compile(
+    r"\b(?:salary|base pay|pay|pay range|pay rate|rate of pay|hourly rate|wages?|"
+    r"compensation|earn(?:ing)?s?)\b",
+    re.IGNORECASE,
+)
+_NON_PAY_AMOUNT_RE = re.compile(
+    r"\b(?:budgets?|revenue|sales|funding|raised|valuation|assets|spend|grants?|"
+    r"members|donations?|deals?|transactions?|arr|gmv|targets?|quota)\b",
+    re.IGNORECASE,
+)
+_MAJOR_CURRENCIES = frozenset({"USD", "CAD", "AUD", "EUR", "GBP", "CHF", "NZD", "SGD"})
+_MAX_PLAUSIBLE_ANNUAL = Decimal("2000000")
+_MIN_INFERRED_ANNUAL = Decimal("15000")
+
+
+def _local_period(passage: str, start: int, end: int) -> SalaryPeriod:
+    after = _PERIOD_AFTER_RE.search(passage[end : end + 40])
+    if after:
+        return _salary_period(after.group("unit") or after.group("adverb"))
+    before = _PERIOD_BEFORE_RE.search(passage[max(0, start - 120) : start])
+    if before:
+        return _salary_period(before.group("adjective") or before.group("unit"))
+    return SalaryPeriod.UNKNOWN
+
+
+def _plausible(salary: NormalizedSalary) -> bool:
+    """Reject annualized major-currency figures no salary reaches."""
+
+    if salary.currency not in _MAJOR_CURRENCIES or not salary.annualization_confident:
+        return True
+    top = salary.annual_maximum or salary.annual_minimum
+    return top is None or top <= _MAX_PLAUSIBLE_ANNUAL
 
 
 def _with_salary_evidence(salary: NormalizedSalary, evidence: str) -> NormalizedSalary:
@@ -732,7 +783,8 @@ def _salary_after_pay_signal(
             scrubbed[match.start() : match.end()] = " " * (match.end() - match.start())
     salary = normalize_salary(
         "".join(scrubbed),
-        period=_salary_period(passage),
+        # Only the words right after the pay signal can state its period.
+        period=_salary_period(suffix[:120]),
     )
     return _with_salary_evidence(salary, passage) if salary is not None else None
 
@@ -741,7 +793,6 @@ def _passage_salary_candidates(
     passage: str,
 ) -> list[tuple[float, NormalizedSalary]]:
     candidates: list[tuple[float, NormalizedSalary]] = []
-    period = _salary_period(passage)
     contains_non_base = _NON_BASE_COMPENSATION_RE.search(passage) is not None
     contains_base_pay = _BASE_PAY_SIGNAL_RE.search(passage) is not None
 
@@ -749,14 +800,37 @@ def _passage_salary_candidates(
         has_range = match.group("high") is not None
         nearby = passage[max(0, match.start() - 100) : match.start()]
         nearby_base_pay = _BASE_PAY_SIGNAL_RE.search(nearby) is not None
+        close_before = passage[max(0, match.start() - 60) : match.start()]
+        pay_context = _PAY_CONTEXT_RE.search(close_before) is not None
         # A lone stipend/bonus/benefit amount is not a salary. A genuine range,
         # explicit base-pay phrase, or pay period remains useful evidence.
         if contains_non_base and not (nearby_base_pay or contains_base_pay):
             continue
-        if not (has_range or nearby_base_pay or period != SalaryPeriod.UNKNOWN):
+        # A lone amount must follow a pay word; "$10M+ annually" in a line
+        # about media budgets is money, not compensation.
+        if not has_range and not pay_context:
             continue
-        salary = normalize_salary(match.group(0), period=period)
+        surrounding = passage[max(0, match.start() - 60) : match.end() + 40]
+        if _NON_PAY_AMOUNT_RE.search(surrounding) and not pay_context:
+            continue
+        local_period = _local_period(passage, match.start(), match.end())
+        salary = normalize_salary(match.group(0), period=local_period)
         if salary is None:
+            continue
+        if (
+            local_period == SalaryPeriod.UNKNOWN
+            and has_range
+            and salary.currency in _MAJOR_CURRENCIES
+            and salary.minimum is not None
+            and salary.maximum is not None
+            and _MIN_INFERRED_ANNUAL <= salary.minimum <= salary.maximum
+            and salary.maximum <= _MAX_PLAUSIBLE_ANNUAL
+            and (pay_context or nearby_base_pay or contains_base_pay)
+        ):
+            # A pay range with no stated period and salary-sized bounds is
+            # annual; smaller or unlabeled figures stay unannualized.
+            salary = normalize_salary(match.group(0), period="year") or salary
+        if not _plausible(salary):
             continue
         salary = _with_salary_evidence(salary, passage)
         score = (

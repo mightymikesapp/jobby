@@ -324,6 +324,12 @@ class RankingProfile(BaseModel):
     # Title terms for role families the candidate does not want. They cap fit
     # at the minimum unless the title also names a target role family.
     excluded_title_terms: list[str] = Field(default_factory=list)
+    # Most years of *legal* experience a requirement may ask for before the
+    # experience gate fails outright; set for candidates not yet admitted.
+    max_legal_years: float | None = Field(default=None, ge=0)
+    # Automatically skip roles whose required bar admission or legal
+    # experience is unmet, the way unpaid roles are skipped.
+    skip_credential_gaps: bool = False
     profile_evidence: list[ProfileFactEvidence] = Field(default_factory=list)
     profile_warnings: list[str] = Field(default_factory=list)
 
@@ -382,7 +388,34 @@ def ranking_profile_from_config(config: Any) -> RankingProfile:
         values["target_seniority"] = config.ranking_target_seniority
     if hasattr(config, "ranking_excluded_title_terms"):
         values["excluded_title_terms"] = list(config.ranking_excluded_title_terms)
+    values.update(_bar_status_values(config))
+    if hasattr(config, "ranking_skip_credential_gaps"):
+        values["skip_credential_gaps"] = bool(config.ranking_skip_credential_gaps)
     return RankingProfile(**values)
+
+
+# A candidate who is not yet admitted cannot have practiced law; requirements
+# of this many years of legal experience or fewer remain within reach.
+_NOT_ADMITTED_MAX_LEGAL_YEARS = 2.0
+
+
+def _bar_status_values(config: Any) -> dict[str, Any]:
+    """Translate the configured bar status into ranking-profile fields."""
+
+    status = getattr(config, "ranking_bar_status", "unknown")
+    if status == "not_admitted":
+        return {
+            "bar_admissions": [],
+            "bar_admissions_known": True,
+            "max_legal_years": _NOT_ADMITTED_MAX_LEGAL_YEARS,
+        }
+    if status == "admitted":
+        jurisdictions = list(getattr(config, "ranking_bar_jurisdictions", []) or [])
+        return {
+            "bar_admissions": jurisdictions or [_ANY_JURISDICTION],
+            "bar_admissions_known": True,
+        }
+    return {}
 
 
 _CURRENT_BAR_KEYS = {
@@ -675,7 +708,8 @@ def ranking_profile_from_database(database: Any, config: Any) -> RankingProfile:
             else "Candidate years of experience are unknown because no approved numeric profile fact establishes them."
         )
 
-    if not bar_known:
+    configured_bar = _bar_status_values(config)
+    if not bar_known and not configured_bar:
         warnings.append(
             "Candidate current bar admission is unknown; approved anticipated, pending, or exam facts are not treated as active admission."
             if future_bar_seen
@@ -706,11 +740,23 @@ def ranking_profile_from_database(database: Any, config: Any) -> RankingProfile:
         )
 
     base = ranking_profile_from_config(config)
+    bar_update: dict[str, Any] = (
+        {
+            "bar_admissions": list(dict.fromkeys(bar_admissions)),
+            "bar_admissions_known": True,
+            "max_legal_years": None,
+        }
+        if bar_known
+        # No approved current-admission fact: the configured status, if any,
+        # stands; otherwise admission stays unknown.
+        else {}
+        if configured_bar
+        else {"bar_admissions": [], "bar_admissions_known": False}
+    )
     return base.model_copy(
         update={
             "years_experience": years_experience,
-            "bar_admissions": list(dict.fromkeys(bar_admissions)),
-            "bar_admissions_known": bar_known,
+            **bar_update,
             "work_authorized": work_authorized,
             "us_citizen": us_citizen,
             "preferred_locations": list(dict.fromkeys(preferred_locations)),
@@ -780,15 +826,51 @@ _PAID_RE = re.compile(
     re.IGNORECASE,
 )
 _BAR_REQUIRED_RE = re.compile(
-    r"\b(?:bar (?:admission|membership) (?:is )?required|required to (?:be )?(?:admitted|licensed)|must (?:be )?(?:admitted|licensed)|active (?:member|membership)[^.]{0,80}\bbar\b|active [^.]{0,80}\bbar (?:member|membership)\b|admitted to (?:the )?[^.]{0,40}\bbar\b|member(?:ship)? in good standing[^.]{0,60}\bbar\b|licensed (?:attorney|to practice law))",
+    r"\b(?:bar (?:admission|membership) (?:is )?required|required to (?:be )?(?:admitted|licensed)|must (?:be )?(?:admitted|licensed)|active (?:member|membership)[^.]{0,80}\bbar\b|active [^.]{0,80}\bbar (?:member|membership)\b|admitted to (?:the )?[^.]{0,40}\bbar\b|member(?:ship)? in good standing[^.]{0,60}\bbar\b|licensed (?:attorney|to practice law)|admission to (?:practice|the bar)|admitted to practice|bar admission (?:in|to)|member of (?:a|the|at least one) (?:state |u\.?s\.? )?bar|active (?:bar|law) license|licensed to practice|licen[cs]e (?:or qualification )?to practice|(?:state|u\.?s\.?) bar association|membership in (?:the |a |good standing (?:of|with|in) (?:the |a )?)?[^.;]{0,40}\bbar\b|member (?:of|in good standing of) (?:a|the|any) [^.;]{0,30}\bstate bar\b)",
     re.IGNORECASE,
 )
+# A "required" phrase inside a sentence that calls it a preference is a
+# preference ("Bar admission in any jurisdiction strongly preferred").
+_BAR_PREFERENCE_WORDS_RE = re.compile(
+    r"\b(?:prefer(?:red|ably)?|a plus|nice to have|desir(?:ed|able)|ideally|bonus)\b",
+    re.IGNORECASE,
+)
+_LEGAL_EXPERIENCE_RE = re.compile(
+    r"\b(?:legal|law|practic(?:e|ing)|attorney|lawyer|litigation|counsel|"
+    r"post[- ]qualification|pqe|law firm|in-house|bar)\b",
+    re.IGNORECASE,
+)
+# Heading-like section markers. A requirement listed under "Preferred
+# qualifications" or "Nice to have" is a preference, not a gate.
+_SECTION_MARKER_RE = re.compile(
+    r"(?P<preferred>\b(?:preferred|desired|desirable|bonus|additional)\s+"
+    r"(?:qualifications|skills|experience|requirements)|nice[- ]to[- ]haves?|"
+    r"\bpluses\b|bonus points|it would be (?:great|nice))|"
+    r"(?P<required>\b(?:minimum|basic|required|key)\s+(?:qualifications|requirements|skills)|"
+    r"\brequirements\b|\bqualifications\b|what you(?:'|\u2019)?ll need|what you will need|"
+    r"what you bring|what we(?:'|\u2019)re looking for|\byou have\b|you might thrive|"
+    r"must[- ]haves?)",
+    re.IGNORECASE,
+)
+# Titles whose experience requirements are, by definition, legal practice.
+_PRACTICE_TITLE_RE = re.compile(
+    r"\b(?:counsel|attorney|lawyer|solicitor|barrister)\b", re.IGNORECASE
+)
+
+
+def _in_preferred_section(text: str, position: int) -> bool:
+    last = None
+    for marker in _SECTION_MARKER_RE.finditer(text[max(0, position - 800) : position]):
+        last = marker
+    return bool(last and last.group("preferred"))
+
+
 _BAR_PREFERRED_RE = re.compile(
     r"\b(?:(?:bar admission|licensed attorney)[^.]{0,50}(?:preferred|a plus)|prefer(?:red)?[^.]{0,50}(?:bar admission|licensed attorney))\b",
     re.IGNORECASE,
 )
 _EXPERIENCE_RE = re.compile(
-    r"\b(?:minimum (?:of )?|at least )?(?P<minimum>\d{1,2})(?:\s*[-\u2013\u2014]\s*(?P<maximum>\d{1,2}))?\+?\s+years?['\u2019]?(?:\s+of)?(?:\s+[a-z][\w/&-]*){0,3}?\s+(?:experience|practicing|practice|working)\b",
+    r"\b(?:minimum (?:of )?|at least )?(?P<minimum>\d{1,2})(?:\s*[-\u2013\u2014]\s*(?P<maximum>\d{1,2}))?\+?\s+years?['\u2019]?(?!\s+(?:ago|old)\b)(?:\s+of)?(?:\s+[a-z][\w/&,-]*){0,8}?\s+(?:experience|practicing|practice|working)\b",
     re.IGNORECASE,
 )
 _AUTH_RE = re.compile(
@@ -902,9 +984,17 @@ _SALARY_SINGLE_RE = re.compile(
 )
 
 
+# "U.S.", "J.D.", and "e.g." would otherwise end a requirement at their
+# periods ("active member of at least one U.S. state bar").
+_LETTER_ABBREVIATION_RE = re.compile(r"\b([A-Za-z])\.([A-Za-z])\.(?:([A-Za-z])\.)?")
+
+
 def _clean_text(value: Any) -> str:
     text = html.unescape(str(value or ""))
     text = _TAG_RE.sub(" ", text)
+    text = _LETTER_ABBREVIATION_RE.sub(
+        lambda match: "".join(part for part in match.groups() if part), text
+    )
     return _SPACE_RE.sub(" ", text).strip()
 
 
@@ -1211,7 +1301,12 @@ _BAR_ABBREVIATIONS = {
 }
 
 
+_ANY_JURISDICTION = "any jurisdiction"
+
+
 def _bar_matches(posting_text: str, admissions: Sequence[str]) -> bool:
+    if _ANY_JURISDICTION in {_normalized(item) for item in admissions}:
+        return True
     admitted = {
         _BAR_ABBREVIATIONS.get(_normalized(item), _normalized(item))
         for item in admissions
@@ -1332,10 +1427,15 @@ def _extract_gates(
             )
         )
 
-    bar_evidence, _ = _find(corpus, _BAR_REQUIRED_RE, "bar admission")
+    bar_evidence, bar_match = _find(corpus, _BAR_REQUIRED_RE, "bar admission")
     preferred_bar_evidence, _ = _find(
         corpus, _BAR_PREFERRED_RE, "bar admission preference"
     )
+    if bar_evidence and (
+        _BAR_PREFERENCE_WORDS_RE.search(bar_evidence.passage)
+        or (bar_match and _in_preferred_section(bar_match.string, bar_match.start()))
+    ):
+        preferred_bar_evidence, bar_evidence = bar_evidence, None
     if bar_evidence:
         passes = _bar_matches(bar_evidence.passage, profile.bar_admissions)
         known = profile.bar_admissions_known or bool(profile.bar_admissions)
@@ -1414,7 +1514,53 @@ def _extract_gates(
     if experience_evidence and experience_match:
         required_years = float(experience_match.group("minimum"))
         stage_years = _STAGE_YEARS.get(profile.target_seniority)
-        if profile.years_experience is None and stage_years is not None:
+        legal_requirement = bool(
+            _LEGAL_EXPERIENCE_RE.search(_experience_context(experience_match))
+            or _PRACTICE_TITLE_RE.search(corpus.get("title", ""))
+        )
+        preferred_only = _in_preferred_section(
+            experience_match.string, experience_match.start()
+        )
+        if (
+            legal_requirement
+            and profile.max_legal_years is not None
+            and required_years > profile.max_legal_years
+            and preferred_only
+        ):
+            gates.append(
+                GateResult(
+                    name=GateName.EXPERIENCE_YEARS,
+                    status=GateStatus.WARNING,
+                    evidence=[experience_evidence],
+                    rationale=(
+                        f"{required_years:g} years of legal experience are listed as a "
+                        "preference, not a requirement."
+                    ),
+                    warning="The preferred legal experience is beyond reach; lead with equivalent work.",
+                    confidence=0.75,
+                )
+            )
+        elif (
+            legal_requirement
+            and profile.max_legal_years is not None
+            and required_years > profile.max_legal_years
+        ):
+            gates.append(
+                GateResult(
+                    name=GateName.EXPERIENCE_YEARS,
+                    status=GateStatus.FAIL,
+                    evidence=[experience_evidence],
+                    rationale=(
+                        f"The posting asks for {required_years:g} years of legal "
+                        "experience, which a candidate not yet admitted to the bar "
+                        "cannot have."
+                    ),
+                    warning="The legal-experience requirement is unmet.",
+                    blocking=True,
+                    confidence=0.85,
+                )
+            )
+        elif profile.years_experience is None and stage_years is not None:
             pass_up_to, warn_up_to = stage_years
             stage = profile.target_seniority
             if required_years <= pass_up_to:
@@ -1800,6 +1946,14 @@ def _extract_gates(
             )
         )
     return gates
+
+
+def _experience_context(match: re.Match[str]) -> str:
+    """The requirement plus its qualifier ("as an attorney"), up to the clause end."""
+
+    tail = match.string[match.end() : match.end() + 60]
+    tail = re.split(r"[.;:,\n]", tail, maxsplit=1)[0]
+    return match.group(0) + tail
 
 
 def _seniority_gate(corpus: Mapping[str, str], profile: RankingProfile) -> GateResult:
@@ -2429,17 +2583,35 @@ def evaluate_job(
         salary_policy_reliable,
         salary_policy_warning,
     )
-    automatic_skip = any(
+    unpaid = any(
         gate.name == GateName.UNPAID_WORK and gate.status == GateStatus.FAIL
         for gate in gates
     )
+    credential_gaps = (
+        [
+            gate
+            for gate in gates
+            if gate.name in {GateName.BAR_ADMISSION, GateName.EXPERIENCE_YEARS}
+            and gate.status == GateStatus.FAIL
+            and gate.blocking
+        ]
+        if ranking_profile.skip_credential_gaps
+        else []
+    )
+    automatic_skip = unpaid or bool(credential_gaps)
+    skip_reasons = (["Explicit unpaid-work language"] if unpaid else []) + [
+        "Required bar admission is not held"
+        if gate.name == GateName.BAR_ADMISSION
+        else "Required legal experience is unmet"
+        for gate in credential_gaps
+    ]
 
     compensation = _compensation_component(
         ranking_profile,
         salary_min,
         salary_max,
         salary_evidence,
-        automatic_skip,
+        unpaid,
         salary_policy_reliable,
         salary_policy_warning,
     )
@@ -2482,7 +2654,7 @@ def evaluate_job(
             else "No blocking gate was found. "
         )
         + (
-            "The role is automatically skipped because it is unpaid."
+            "The role is automatically skipped: " + "; ".join(skip_reasons) + "."
             if automatic_skip
             else "Missing facts remain warnings rather than assumed passes."
         )
@@ -2514,7 +2686,7 @@ def evaluate_job(
         explanation=explanation,
         confidence=confidence,
         automatic_skip=automatic_skip,
-        skip_reason="Explicit unpaid-work language" if automatic_skip else None,
+        skip_reason="; ".join(skip_reasons) if automatic_skip else None,
         ranking_eligible=not automatic_skip,
         manual_override=override is not None,
         locked=override.locked if override else False,
@@ -2854,6 +3026,22 @@ def persist_evaluation(
             },
         )
         return row
+
+
+def apply_automatic_status(job: Any, evaluation: Any) -> None:
+    """Ignore automatically skipped jobs and reopen them once the skip lifts.
+
+    A status the user locked is never changed.
+    """
+
+    from .enums import JobStatus
+
+    if job is None or job.manual_status_locked:
+        return
+    if evaluation.automatic_skip:
+        job.status = JobStatus.IGNORED
+    elif job.status == JobStatus.IGNORED:
+        job.status = JobStatus.DISCOVERED
 
 
 def evaluate_and_persist(

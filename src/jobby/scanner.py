@@ -45,7 +45,7 @@ from .normalization import (
     normalize_url,
 )
 from .openai_provider import OpenAIProvider
-from .ranking import RankingProfile, persist_evaluation
+from .ranking import RankingProfile, apply_automatic_status, persist_evaluation
 from .review_queues import suggest_duplicate
 from .sources.ats import (
     AshbySource,
@@ -332,15 +332,9 @@ class Scanner:
                     )
                 )
                 continue
-            job = session.get(Job, job_id)
-            if job and evaluation.automatic_skip and not job.manual_status_locked:
-                job.status = JobStatus.IGNORED
-            elif (
-                job and job.status == JobStatus.IGNORED and not job.manual_status_locked
-            ):
-                # Automatically ignored unpaid roles may reopen if a later
-                # source description removes that gate. User ignores lock.
-                job.status = JobStatus.DISCOVERED
+            # Automatically skipped roles are ignored and reopen if a later
+            # observation lifts the skip. A status the user locked is kept.
+            apply_automatic_status(session.get(Job, job_id), evaluation)
         try:
             with session.begin_nested():
                 self._persist_duplicates(session, item_jobs)
@@ -955,15 +949,7 @@ class Scanner:
                         )
                     )
                     continue
-                job = session.get(Job, job_id)
-                if job and evaluation.automatic_skip and not job.manual_status_locked:
-                    job.status = JobStatus.IGNORED
-                elif (
-                    job
-                    and job.status == JobStatus.IGNORED
-                    and not job.manual_status_locked
-                ):
-                    job.status = JobStatus.DISCOVERED
+                apply_automatic_status(session.get(Job, job_id), evaluation)
             try:
                 with session.begin_nested():
                     self._persist_duplicates(session, pairs)
@@ -1109,6 +1095,20 @@ class Scanner:
                 job.remote_status = item.remote.value
             if compensation_text and "compensation" not in authoritative:
                 job.compensation_text = compensation_text
+            if (
+                salary is None
+                and item.salary is None
+                and item.description
+                and "compensation" not in authoritative
+            ):
+                # The description was re-read and states no pay; drop any
+                # figure an earlier extraction derived from it.
+                job.salary_min = None
+                job.salary_max = None
+                job.compensation_period = "unknown"
+                job.compensation_confidence = 0.0
+                job.compensation_text = None
+                job.compensation_evidence = None
             if salary is not None and "compensation" not in authoritative:
                 salary_min, salary_max, currency = _salary_values(salary)
                 job.salary_min = salary_min

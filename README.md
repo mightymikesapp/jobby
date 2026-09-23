@@ -270,7 +270,14 @@ target family gets the minimum fit and a `role_family` gate failure.
 seniority gate for title tiers and, when no approved years-of-experience fact
 exists, grades stated experience requirements against that stage. Stated
 requirements the profile cannot confirm, such as a required bar admission,
-cost more than unmentioned ones. After changing these settings or upgrading
+cost more than unmentioned ones. `ranking_bar_status` (`unknown`,
+`not_admitted`, or `admitted` with optional `ranking_bar_jurisdictions`) sets
+bar admission when no approved current-admission fact exists; `not_admitted`
+fails required bar admission and more than two years of required legal
+experience (any experience requirement on a Counsel or Attorney title counts).
+Requirements listed under "Preferred" or "Nice to have" only warn. With
+`ranking_skip_credential_gaps = true`, those roles are moved to ignored the way
+unpaid roles are, and reopen on rescore after the status changes. After changing these settings or upgrading
 the ranker, `jobby maintenance rescore` re-ranks every job while keeping
 evaluation history and locked manual scores.
 

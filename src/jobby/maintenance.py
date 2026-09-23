@@ -176,12 +176,14 @@ def rescore_evaluations(
 
     Each job keeps its evaluation history: ``persist_evaluation`` reuses an
     identical automatic result, writes a new current row when the ranker or
-    profile changed, and never replaces a locked manual override.
+    profile changed, and never replaces a locked manual override. Statuses
+    follow the scan rule for automatically skipped roles.
     """
 
     from .models import Evaluation, Job
     from .ranking import (
         RANKER_VERSION,
+        apply_automatic_status,
         persist_evaluation,
         ranking_profile_from_database,
     )
@@ -204,6 +206,9 @@ def rescore_evaluations(
                 row = persist_evaluation(session, job_id, profile=profile)
                 if row.id != before:
                     changed += 1
+                # Same status rule as a scan: skipped roles are ignored and
+                # reopen once the skip lifts; user-locked statuses are kept.
+                apply_automatic_status(session.get(Job, job_id), row)
     with database.session() as session:
         run = MaintenanceRun(
             kind="rescore",
