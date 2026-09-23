@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import re
+import socket
 
 import httpx
 from sqlalchemy import select
@@ -16,7 +17,11 @@ from .openai_provider import OpenAIProvider
 from .ranking import ranking_profile_from_database
 from .scanner import Scanner, build_configured_sources
 from .sources.base import JobSource
-from .sources.browser import PortalConfig, PublicPortalSource
+from .sources.browser import (
+    PinnedPublicHTTPTransport,
+    PortalConfig,
+    PublicPortalSource,
+)
 
 
 MAX_MANUAL_QUERY_CHARS = 2_000
@@ -159,6 +164,11 @@ def run_discovery_scan(
             requested_sources=[source.source_key for source in sources],
         )
     with httpx.Client(
+        transport=PinnedPublicHTTPTransport(
+            socket.getaddrinfo,
+            max_connections=10,
+            max_keepalive_connections=5,
+        ),
         timeout=httpx.Timeout(20, connect=10),
         follow_redirects=False,
         headers={"User-Agent": f"Jobby/{__version__} local personal job discovery"},

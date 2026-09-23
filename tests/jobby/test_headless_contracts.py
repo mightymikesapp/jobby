@@ -147,3 +147,23 @@ def test_background_operation_returns_durable_status(database: Database):
             time.sleep(0.01)
         assert status["status"] == "failed"
         assert status["error"]
+
+
+def test_background_operation_error_redacts_credentials(
+    database: Database, monkeypatch
+):
+    secret = "sk-" + "a" * 32
+
+    def leaky_scan(*_args, **_kwargs):
+        raise RuntimeError(f"upstream rejected Authorization: Bearer {secret}")
+
+    monkeypatch.setattr("jobby.facade.run_discovery_scan", leaky_scan)
+    with ApplicationFacade(database, actor="mcp_client") as facade:
+        queued = facade.run_scan(source="all", background=True)
+        for _ in range(50):
+            status = facade.get_operation_status(queued["operation_id"])
+            if status["status"] == "failed":
+                break
+            time.sleep(0.01)
+        assert status["status"] == "failed"
+        assert secret not in status["error"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from jobby.config import AppConfig
@@ -10,6 +11,7 @@ from jobby.db import Database
 from jobby.discovery_service import manual_source_options, run_discovery_scan
 from jobby.enums import AgentRunStatus
 from jobby.models import SourceConfig
+from jobby.sources.browser import PinnedPublicHTTPTransport
 
 
 class MappingSecrets:
@@ -124,6 +126,7 @@ def test_manual_ats_client_ignores_proxy_environment_and_rejects_redirects(
 
     assert captured["trust_env"] is False
     assert captured["follow_redirects"] is False
+    assert isinstance(captured["transport"], PinnedPublicHTTPTransport)
 
 
 def test_paid_web_requires_service_permission_and_nonblank_query(
@@ -216,3 +219,15 @@ def test_individual_enabled_portals_are_selectable(
     assert len(RecordingScanner.calls) == 1
     assert RecordingScanner.calls[0]["query"] == "counsel"
     assert RecordingScanner.calls[0]["requested_sources"] == ["portal:acme-careers"]
+
+
+def test_pinned_scan_transport_refuses_hosts_resolving_to_private_addresses() -> None:
+    def rebound_resolver(host, port, **_kwargs):
+        return [(None, None, None, "", ("169.254.169.254", port))]
+
+    transport = PinnedPublicHTTPTransport(
+        rebound_resolver, max_connections=10, max_keepalive_connections=5
+    )
+    with httpx.Client(transport=transport) as client:
+        with pytest.raises(OSError, match="unsafe resolved address"):
+            client.get("https://boards-api.greenhouse.io/v1/boards/x/jobs")

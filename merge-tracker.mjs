@@ -12,7 +12,7 @@
  * Adapted from career-ops merge-tracker.mjs for legal job search context.
  */
 
-import { readdir, readFile, writeFile } from 'fs/promises';
+import { open, readdir, readFile, rename, unlink } from 'fs/promises';
 import { resolve, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -20,6 +20,25 @@ import { dirname } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = resolve(__dirname, 'reports');
 const PIPELINE_FILE = resolve(__dirname, 'data/pipeline.md');
+
+// Write via a same-directory temp file + rename so a crash mid-write can never
+// leave the tracker truncated.
+async function atomicWrite(path, content) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  const handle = await open(tmp, 'w', 0o600);
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(tmp, path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
 
 const COMPANY_ALIASES = new Map([
   ['ferc', 'ferc'],
@@ -189,7 +208,7 @@ async function main() {
   );
 
   pipelineContent = pipelineContent.trimEnd() + '\n' + newLines.join('\n') + '\n';
-  await writeFile(PIPELINE_FILE, pipelineContent);
+  await atomicWrite(PIPELINE_FILE, pipelineContent);
 
   console.log(`\nMerged ${newEntries.length} entries into data/pipeline.md`);
 }

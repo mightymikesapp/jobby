@@ -129,13 +129,19 @@ class _PinnedNetworkBackend(httpcore.SyncBackend):
 
 
 class _PinnedHTTPTransport(httpx.HTTPTransport):
-    def __init__(self, resolver: Callable[..., list[Any]]) -> None:
+    def __init__(
+        self,
+        resolver: Callable[..., list[Any]],
+        *,
+        max_connections: int = 4,
+        max_keepalive_connections: int = 2,
+    ) -> None:
         super().__init__(trust_env=False, retries=0)
         cast(httpcore.ConnectionPool, self._pool).close()
         self._pool = httpcore.ConnectionPool(
             ssl_context=ssl.create_default_context(),
-            max_connections=4,
-            max_keepalive_connections=2,
+            max_connections=max_connections,
+            max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=5.0,
             http1=True,
             http2=False,

@@ -12,12 +12,31 @@
  * Adapted from career-ops dedup-tracker.mjs for legal job search context.
  */
 
-import { readFile, writeFile } from 'fs/promises';
+import { open, readFile, rename, unlink } from 'fs/promises';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PIPELINE_FILE = resolve(__dirname, 'data/pipeline.md');
+
+// Write via a same-directory temp file + rename so a crash mid-write can never
+// leave the tracker truncated.
+async function atomicWrite(path, content) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  const handle = await open(tmp, 'w', 0o600);
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(tmp, path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
 
 // Status advancement order (higher = more advanced)
 const STATUS_RANK = {
@@ -166,7 +185,7 @@ async function main() {
     if (t.type === 'other') out.push(t.text);
     else if (!t.dropped) out.push(t.raw);
   }
-  await writeFile(PIPELINE_FILE, out.join('\n'));
+  await atomicWrite(PIPELINE_FILE, out.join('\n'));
 
   console.log(`Updated data/pipeline.md`);
 }

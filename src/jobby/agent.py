@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import socket
 import stat
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -19,6 +20,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from sqlalchemy import distinct, func, or_, select
 
+from . import __version__
 from .audit import json_safe, record_audit
 from .config import AppConfig, SecretStore
 from .db import Database
@@ -43,6 +45,7 @@ from .ranking import ranking_profile_from_database
 from .review_queues import alert_fingerprint, create_or_recur_alert, resolve_alert
 from .scanner import Scanner, build_configured_sources
 from .scheduler import rotate_log_files
+from .sources.browser import PinnedPublicHTTPTransport
 from .sources.base import (
     JobSource,
     ScanItem,
@@ -221,9 +224,16 @@ class DailyAgent:
             scan_run = self._empty_focused_scan()
         else:
             with httpx.Client(
+                transport=PinnedPublicHTTPTransport(
+                    socket.getaddrinfo,
+                    max_connections=10,
+                    max_keepalive_connections=5,
+                ),
                 timeout=httpx.Timeout(20, connect=10),
                 follow_redirects=False,
-                headers={"User-Agent": "Jobby/0.1 local personal job discovery"},
+                headers={
+                    "User-Agent": f"Jobby/{__version__} local personal job discovery"
+                },
                 limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
                 trust_env=False,
             ) as client:

@@ -76,6 +76,7 @@ from .review_queues import (
 )
 from .discovery_service import run_discovery_scan
 from .job_queries import JobListFilters, JobSort, query_jobs_page
+from .sources.base import sanitize_error_message
 
 
 MAX_PAGE = 200
@@ -1151,7 +1152,7 @@ class ApplicationFacade:
                 operation = session.get(OperationRun, operation_id)
                 if operation is not None:
                     operation.status = "failed"
-                    operation.error = str(exc)[:2_000]
+                    operation.error = sanitize_error_message(exc)
                     operation.finished_at = utc_now()
 
     def _start_operation(self, kind: str, request: Mapping[str, Any]) -> dict[str, Any]:
