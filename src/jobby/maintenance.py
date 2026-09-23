@@ -169,6 +169,89 @@ def optimize_database(
             database.dispose()
 
 
+def rescore_evaluations(
+    database: Database, config: object, *, batch_size: int = 500
+) -> MaintenanceResult:
+    """Re-run the deterministic ranker for every job with the current profile.
+
+    Each job keeps its evaluation history: ``persist_evaluation`` reuses an
+    identical automatic result, writes a new current row when the ranker or
+    profile changed, and never replaces a locked manual override.
+    """
+
+    from .models import Evaluation, Job
+    from .ranking import (
+        RANKER_VERSION,
+        persist_evaluation,
+        ranking_profile_from_database,
+    )
+
+    if not 1 <= batch_size <= 5_000:
+        raise ValueError("rescore batch size must be between 1 and 5,000")
+    started = datetime.now(timezone.utc)
+    profile = ranking_profile_from_database(database, config)
+    with database.session() as session:
+        job_ids = list(session.scalars(select(Job.id).order_by(Job.id)))
+    changed = 0
+    for offset in range(0, len(job_ids), batch_size):
+        with database.session() as session:
+            for job_id in job_ids[offset : offset + batch_size]:
+                before = session.scalar(
+                    select(Evaluation.id).where(
+                        Evaluation.job_id == job_id, Evaluation.is_current.is_(True)
+                    )
+                )
+                row = persist_evaluation(session, job_id, profile=profile)
+                if row.id != before:
+                    changed += 1
+    with database.session() as session:
+        run = MaintenanceRun(
+            kind="rescore",
+            status="succeeded",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc),
+            result_json={
+                "jobs": len(job_ids),
+                "rescored": changed,
+                "ranker_version": RANKER_VERSION,
+            },
+        )
+        session.add(run)
+        session.flush()
+        record_audit(
+            session,
+            action="maintenance.rescored",
+            entity_type="maintenance_run",
+            entity_id=run.id,
+            actor="user",
+            after=run.result_json,
+        )
+        return MaintenanceResult(
+            kind="rescore",
+            changed=changed,
+            detail=(
+                f"{changed:,} of {len(job_ids):,} jobs have a new current evaluation "
+                f"from {RANKER_VERSION}"
+            ),
+            run_id=run.id,
+        )
+
+
+def rescore_evaluations_exclusive(
+    database_path: Path | str,
+    *,
+    paths: JobbyPaths,
+    config: object,
+    lock_timeout: float = 0.0,
+) -> MaintenanceResult:
+    return _run_exclusive_maintenance(
+        database_path,
+        paths=paths,
+        lock_timeout=lock_timeout,
+        operation=lambda database: rescore_evaluations(database, config),
+    )
+
+
 def recover_stale_runs(
     database: Database,
     *,

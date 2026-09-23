@@ -38,17 +38,19 @@ class ScoreDimension(StrEnum):
     LOCATION = "location_col"
 
 
+# Fit and gate passability lead: a well-paid role the candidate is not
+# eligible for, or does not want, must not outrank an attainable target role.
 SCORE_WEIGHTS: dict[ScoreDimension, float] = {
-    ScoreDimension.COMPENSATION: 0.25,
-    ScoreDimension.WORKLOAD_STRESS: 0.25,
-    ScoreDimension.FIT: 0.20,
-    ScoreDimension.GATE_PASSABILITY: 0.15,
+    ScoreDimension.FIT: 0.30,
+    ScoreDimension.GATE_PASSABILITY: 0.30,
+    ScoreDimension.COMPENSATION: 0.15,
     ScoreDimension.STRATEGIC_OPTIONALITY: 0.10,
+    ScoreDimension.WORKLOAD_STRESS: 0.10,
     ScoreDimension.LOCATION_COL: 0.05,
 }
 # A concise alias is useful to renderers and callers that already use the term.
 WEIGHTS = SCORE_WEIGHTS
-RANKER_VERSION = "deterministic-v2.0.0"
+RANKER_VERSION = "deterministic-v3.0.0"
 
 
 class GateName(StrEnum):
@@ -62,6 +64,8 @@ class GateName(StrEnum):
     QUOTA = "quota"
     TRAVEL = "travel"
     ON_CALL = "on_call"
+    SENIORITY = "seniority"
+    ROLE_FAMILY = "role_family"
 
 
 class GateStatus(StrEnum):
@@ -186,6 +190,88 @@ DEFAULT_EDGE_ASSETS: dict[str, list[str]] = {
 }
 
 
+# Title vocabulary per edge-asset category. A job title that names the
+# candidate's role family is far stronger evidence than a description mention,
+# which is often boilerplate ("our legal team", "intellectual property rights").
+TITLE_FAMILIES: dict[str, list[str]] = {
+    "legal_ai_build": [
+        "legal engineer",
+        "legal engineering",
+        "legal technology",
+        "legal tech",
+        "legal ai",
+        "legal innovation",
+        "legal operations",
+        "legal ops",
+        "legal data",
+        "knowledge engineer",
+    ],
+    "ip_patent": [
+        "intellectual property",
+        "ip",
+        "patent",
+        "copyright",
+        "trademark",
+        "licensing",
+        "rights",
+        "clearance",
+        "business affairs",
+        "brand protection",
+        "content protection",
+    ],
+    "jd_legal": [
+        "legal",
+        "counsel",
+        "attorney",
+        "lawyer",
+        "law clerk",
+        "judicial clerk",
+        "juris",
+        "contracts",
+        "contract manager",
+        "contract specialist",
+        "contract administrator",
+        "contract analyst",
+        "contract negotiator",
+        "contract compliance",
+        "contract management",
+    ],
+    "ai_governance_policy": [
+        "policy",
+        "governance",
+        "regulatory",
+        "compliance",
+        "trust and safety",
+        "trust & safety",
+        "integrity",
+        "public affairs",
+        "government affairs",
+        "privacy",
+        "responsible ai",
+        "ai safety",
+    ],
+}
+
+SENIORITY_LEVELS = ("any", "early", "mid", "senior")
+# Title terms by seniority tier. Executive titles are out of reach below the
+# senior stage; senior/lead titles are a stretch for an early-career profile.
+# "Staff", "partner", and "executive" are deliberately absent: Staff Attorney
+# is an early-career legal title, and Business Partner, Executive Assistant,
+# and Account Executive are not executive-level roles.
+_EXECUTIVE_TITLE_RE = re.compile(
+    r"\b(?:director|head of|vice president|vp|svp|evp|chief|general counsel|"
+    r"principal)\b",
+    re.IGNORECASE,
+)
+_SENIOR_TITLE_RE = re.compile(r"\b(?:senior|sr|lead)\b\.?", re.IGNORECASE)
+# Years a stage can reasonably claim when no numeric fact is approved:
+# (pass up to, warn up to); anything above the second value fails.
+_STAGE_YEARS: dict[str, tuple[float, float]] = {
+    "early": (2.0, 4.0),
+    "mid": (5.0, 7.0),
+}
+
+
 class RankingProfile(BaseModel):
     """Candidate facts and hard preferences used by deterministic ranking."""
 
@@ -232,13 +318,27 @@ class RankingProfile(BaseModel):
             key: list(values) for key, values in DEFAULT_EDGE_ASSETS.items()
         }
     )
+    # Career stage used for seniority and unstated-years policy; "any" keeps
+    # the evidence-only behavior (no seniority gate).
+    target_seniority: str = "any"
+    # Title terms for role families the candidate does not want. They cap fit
+    # at the minimum unless the title also names a target role family.
+    excluded_title_terms: list[str] = Field(default_factory=list)
     profile_evidence: list[ProfileFactEvidence] = Field(default_factory=list)
     profile_warnings: list[str] = Field(default_factory=list)
 
-    @field_validator("bar_admissions", "preferred_locations")
+    @field_validator("bar_admissions", "preferred_locations", "excluded_title_terms")
     @classmethod
     def discard_blank_list_values(cls, value: list[str]) -> list[str]:
         return [item.strip() for item in value if item and item.strip()]
+
+    @field_validator("target_seniority")
+    @classmethod
+    def known_seniority(cls, value: str) -> str:
+        normalized = str(value or "any").strip().casefold()
+        if normalized not in SENIORITY_LEVELS:
+            raise ValueError(f"target_seniority must be one of {SENIORITY_LEVELS}")
+        return normalized
 
 
 class JobFacts(BaseModel):
@@ -277,9 +377,12 @@ def ranking_profile_from_config(config: Any) -> RankingProfile:
         "nyc_salary_floor",
         "bay_area_salary_floor",
     )
-    return RankingProfile(
-        **{name: getattr(config, name) for name in names if hasattr(config, name)}
-    )
+    values = {name: getattr(config, name) for name in names if hasattr(config, name)}
+    if hasattr(config, "ranking_target_seniority"):
+        values["target_seniority"] = config.ranking_target_seniority
+    if hasattr(config, "ranking_excluded_title_terms"):
+        values["excluded_title_terms"] = list(config.ranking_excluded_title_terms)
+    return RankingProfile(**values)
 
 
 _CURRENT_BAR_KEYS = {
@@ -589,7 +692,9 @@ def ranking_profile_from_database(database: Any, config: Any) -> RankingProfile:
                 matched.extend(matching_terms)
                 source(f"edge_assets.{asset}", fact)
         if matched:
-            edge_assets[asset] = list(dict.fromkeys(matched))
+            # The fact establishes the category; postings are matched with the
+            # category's full vocabulary, not only the words the fact used.
+            edge_assets[asset] = list(dict.fromkeys([*matched, *terms]))
     if not edge_assets:
         warnings.append(
             "Candidate fit assets are unavailable because no approved profile fact supports a configured edge."
@@ -683,7 +788,7 @@ _BAR_PREFERRED_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPERIENCE_RE = re.compile(
-    r"\b(?:minimum (?:of )?|at least )?(?P<minimum>\d{1,2})(?:\s*[-\u2013\u2014]\s*(?P<maximum>\d{1,2}))?\+?\s+years?(?:\s+of)?(?:\s+(?:relevant|related|professional|legal|post[- ]qualification))?\s+experience\b",
+    r"\b(?:minimum (?:of )?|at least )?(?P<minimum>\d{1,2})(?:\s*[-\u2013\u2014]\s*(?P<maximum>\d{1,2}))?\+?\s+years?['\u2019]?(?:\s+of)?(?:\s+[a-z][\w/&-]*){0,3}?\s+(?:experience|practicing|practice|working)\b",
     re.IGNORECASE,
 )
 _AUTH_RE = re.compile(
@@ -1308,7 +1413,41 @@ def _extract_gates(
     )
     if experience_evidence and experience_match:
         required_years = float(experience_match.group("minimum"))
-        if profile.years_experience is None:
+        stage_years = _STAGE_YEARS.get(profile.target_seniority)
+        if profile.years_experience is None and stage_years is not None:
+            pass_up_to, warn_up_to = stage_years
+            stage = profile.target_seniority
+            if required_years <= pass_up_to:
+                status, warning = GateStatus.PASS, None
+                rationale = (
+                    f"The {required_years:g}-year requirement is within reach for "
+                    f"the configured {stage}-career stage."
+                )
+            elif required_years <= warn_up_to:
+                status = GateStatus.WARNING
+                rationale = (
+                    f"The {required_years:g}-year requirement is a stretch for the "
+                    f"configured {stage}-career stage."
+                )
+                warning = "The years-of-experience requirement is a stretch; lead with equivalent experience."
+            else:
+                status = GateStatus.FAIL
+                rationale = (
+                    f"The {required_years:g}-year requirement is beyond the "
+                    f"configured {stage}-career stage."
+                )
+                warning = "The years-of-experience requirement is likely out of reach."
+            gates.append(
+                GateResult(
+                    name=GateName.EXPERIENCE_YEARS,
+                    status=status,
+                    evidence=[experience_evidence],
+                    rationale=rationale,
+                    warning=warning,
+                    confidence=0.8,
+                )
+            )
+        elif profile.years_experience is None:
             gates.append(
                 GateResult(
                     name=GateName.EXPERIENCE_YEARS,
@@ -1346,6 +1485,23 @@ def _extract_gates(
                 rationale="No explicit years-of-experience requirement was found.",
                 warning="Years-of-experience requirements may be unstated.",
                 confidence=0.55,
+            )
+        )
+
+    gates.append(_seniority_gate(corpus, profile))
+    excluded_family = _excluded_role_family(
+        corpus, profile, _title_role_families(corpus, profile)
+    )
+    if excluded_family:
+        term, passage = excluded_family
+        gates.append(
+            GateResult(
+                name=GateName.ROLE_FAMILY,
+                status=GateStatus.FAIL,
+                evidence=[passage],
+                rationale=f"The title names an excluded role family ({term}).",
+                warning="The role is outside the candidate's target role families.",
+                confidence=0.85,
             )
         )
 
@@ -1646,6 +1802,47 @@ def _extract_gates(
     return gates
 
 
+def _seniority_gate(corpus: Mapping[str, str], profile: RankingProfile) -> GateResult:
+    """Compare the title's seniority tier with the configured career stage."""
+
+    stage = profile.target_seniority
+    if stage in {"any", "senior"}:
+        return GateResult(
+            name=GateName.SENIORITY,
+            status=GateStatus.NOT_APPLICABLE,
+            rationale="No career-stage seniority policy is configured.",
+            confidence=0.6,
+        )
+    executive, _ = _find(corpus, _EXECUTIVE_TITLE_RE, "seniority", sources=("title",))
+    senior, _ = _find(corpus, _SENIOR_TITLE_RE, "seniority", sources=("title",))
+    if executive and stage == "early":
+        status, rationale = (
+            GateStatus.FAIL,
+            "The title is executive-level, beyond the configured early-career stage.",
+        )
+    elif executive or (senior and stage == "early"):
+        status, rationale = (
+            GateStatus.WARNING,
+            f"The title is above the configured {stage}-career stage.",
+        )
+    else:
+        return GateResult(
+            name=GateName.SENIORITY,
+            status=GateStatus.PASS,
+            rationale=f"The title fits the configured {stage}-career stage.",
+            confidence=0.7,
+        )
+    evidence = executive or senior
+    return GateResult(
+        name=GateName.SENIORITY,
+        status=status,
+        evidence=[evidence] if evidence else [],
+        rationale=rationale,
+        warning="The role is likely more senior than the candidate's current stage.",
+        confidence=0.85,
+    )
+
+
 def _stress_gate(
     name: GateName,
     evidence: EvidencePassage | None,
@@ -1704,7 +1901,10 @@ def _compensation_component(
         midpoint = (salary_min + salary_max) / 2
         if profile.salary_floor:
             if salary_max < profile.salary_floor:
-                score = 1.0
+                # Graded, so paid work just under the floor does not tie with
+                # unpaid work (which alone scores 1.0).
+                ratio = salary_max / profile.salary_floor
+                score = 2.5 if ratio >= 0.75 else 1.75 if ratio >= 0.5 else 1.25
             elif salary_min >= profile.salary_floor * 1.75:
                 score = 5.0
             elif midpoint >= profile.salary_floor * 1.4:
@@ -1805,27 +2005,80 @@ def _workload_component(
     )
 
 
+def _title_role_families(
+    corpus: Mapping[str, str], profile: RankingProfile
+) -> dict[str, EvidencePassage]:
+    """Profile categories whose role family the job title names."""
+
+    found: dict[str, EvidencePassage] = {}
+    for asset in profile.edge_assets:
+        for term in TITLE_FAMILIES.get(asset, []):
+            passage, _ = _find(
+                corpus,
+                _literal_pattern(term),
+                f"fit (title): {asset}",
+                sources=("title",),
+            )
+            if passage:
+                found[asset] = passage
+                break
+    return found
+
+
+def _excluded_role_family(
+    corpus: Mapping[str, str],
+    profile: RankingProfile,
+    title_families: Mapping[str, EvidencePassage],
+) -> tuple[str, EvidencePassage] | None:
+    """An excluded title term, unless the title also names a target family."""
+
+    if title_families:
+        return None
+    for term in profile.excluded_title_terms:
+        passage, _ = _find(
+            corpus, _literal_pattern(term), "excluded role family", sources=("title",)
+        )
+        if passage:
+            return term, passage
+    return None
+
+
 def _fit_component(
     corpus: Mapping[str, str], profile: RankingProfile
 ) -> tuple[ScoreComponent, set[str]]:
-    evidence: list[EvidencePassage] = []
-    matched_assets: set[str] = set()
+    title_families = _title_role_families(corpus, profile)
+    excluded = _excluded_role_family(corpus, profile, title_families)
+    if excluded:
+        term, passage = excluded
+        return ScoreComponent(
+            dimension=ScoreDimension.FIT,
+            score=1.0,
+            weight=SCORE_WEIGHTS[ScoreDimension.FIT],
+            evidence=[passage],
+            confidence=0.85,
+            rationale=(
+                f"The title names an excluded role family ({term}) and no target role family."
+            ),
+        ), set()
+    evidence: list[EvidencePassage] = list(title_families.values())
+    description_assets: set[str] = set()
     for asset, terms in profile.edge_assets.items():
+        if asset in title_families:
+            continue
         for term in terms:
             if passage := _find_literal(corpus, term, f"fit: {asset}"):
-                matched_assets.add(asset)
+                description_assets.add(asset)
                 evidence.append(passage)
                 break
-    count = len(matched_assets)
-    score = {0: 1.5, 1: 2.5, 2: 3.5, 3: 4.25}.get(count, 5.0)
-    missing = (
-        None
-        if count
-        else "No configured candidate-edge asset was found in the posting."
+    matched_assets = set(title_families) | description_assets
+    score = (
+        1.5 + 1.5 * min(len(title_families), 2) + 0.4 * min(len(description_assets), 3)
     )
     rationale = (
-        f"The posting uses {count} candidate-edge asset categor{'y' if count == 1 else 'ies'}: "
-        + (", ".join(sorted(matched_assets)) if matched_assets else "none")
+        "Title role families: "
+        + (", ".join(sorted(title_families)) if title_families else "none")
+        + "; description-only categories: "
+        + (", ".join(sorted(description_assets)) if description_assets else "none")
         + "."
     )
     return ScoreComponent(
@@ -1833,8 +2086,12 @@ def _fit_component(
         score=_clip_score(score),
         weight=SCORE_WEIGHTS[ScoreDimension.FIT],
         evidence=_unique_evidence(evidence),
-        missing_data_warning=missing,
-        confidence=0.85 if count >= 2 else 0.7 if count == 1 else 0.35,
+        missing_data_warning=(
+            None
+            if matched_assets
+            else "No configured candidate-edge asset was found in the posting."
+        ),
+        confidence=0.85 if title_families else 0.6 if matched_assets else 0.35,
         rationale=rationale,
     ), matched_assets
 
@@ -1856,7 +2113,16 @@ def _gate_component(gates: Sequence[GateResult]) -> ScoreComponent:
             GateName.LOCATION,
         }
     ]
-    score = 5.0 - 1.25 * len(failures) - 0.5 * len(warnings) - 0.15 * len(unknown_core)
+    # A requirement the posting states but the profile cannot confirm (for
+    # example, bar admission required) is a real risk; an unmentioned one is not.
+    stated_unknown = [gate for gate in unknown_core if gate.evidence]
+    score = (
+        5.0
+        - 1.25 * len(failures)
+        - 0.5 * len(warnings)
+        - 0.6 * len(stated_unknown)
+        - 0.15 * (len(unknown_core) - len(stated_unknown))
+    )
     evidence = _unique_evidence([item for gate in gates for item in gate.evidence])
     missing = None
     if unknown_core:

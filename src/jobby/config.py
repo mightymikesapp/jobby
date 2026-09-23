@@ -497,6 +497,16 @@ class AppConfig(BaseModel):
     # Pages of 20 postings read per Workday board on daily and manual scans.
     # Weekly inventory scans read up to ``source_record_cap`` regardless.
     workday_scan_max_pages: int = Field(default=100, ge=1, le=250, strict=True)
+    # Ranking career stage: "early" gates senior titles and long experience
+    # requirements; "any" keeps evidence-only ranking with no seniority gate.
+    ranking_target_seniority: Literal["any", "early", "mid", "senior"] = "any"
+    # Title terms for unwanted role families (e.g. "software engineer"); they
+    # cap fit unless the title also names a target role family.
+    ranking_excluded_title_terms: list[
+        Annotated[
+            str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+        ]
+    ] = Field(default_factory=list, max_length=200)
     portal_crawl_delay_seconds: float = Field(
         default=1.0, ge=0, le=30, allow_inf_nan=False
     )

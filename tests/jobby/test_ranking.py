@@ -71,11 +71,11 @@ def test_invalid_persisted_salary_cannot_trigger_an_automatic_floor_rejection(
 
 def test_weights_and_final_score_are_exactly_the_stress_adjusted_scorecard():
     assert SCORE_WEIGHTS == {
-        ScoreDimension.COMPENSATION: 0.25,
-        ScoreDimension.WORKLOAD_STRESS: 0.25,
-        ScoreDimension.FIT: 0.20,
-        ScoreDimension.GATE_PASSABILITY: 0.15,
+        ScoreDimension.FIT: 0.30,
+        ScoreDimension.GATE_PASSABILITY: 0.30,
+        ScoreDimension.COMPENSATION: 0.15,
         ScoreDimension.STRATEGIC_OPTIONALITY: 0.10,
+        ScoreDimension.WORKLOAD_STRESS: 0.10,
         ScoreDimension.LOCATION_COL: 0.05,
     }
     assert sum(SCORE_WEIGHTS.values()) == pytest.approx(1.0)
@@ -433,7 +433,10 @@ def test_database_profile_uses_only_explicit_approved_facts_with_provenance(
         assert {"San Diego", "Los Angeles", "Remote"}.issubset(
             profile.preferred_locations
         )
-        assert profile.edge_assets["legal_ai_build"] == ["legal ai"]
+        # The fact establishes the category; postings match its full vocabulary.
+        assert profile.edge_assets["legal_ai_build"][0] == "legal ai"
+        assert "workflow automation" in profile.edge_assets["legal_ai_build"]
+        assert "ip_patent" not in profile.edge_assets
         assert "unreviewed.work_authorized" not in {
             item.fact_key for item in profile.profile_evidence
         }

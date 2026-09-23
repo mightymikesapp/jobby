@@ -418,6 +418,12 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance_optimize.add_argument(
         "--lock-timeout", type=_nonnegative_timeout, default=0.0
     )
+    maintenance_rescore = maintenance_sub.add_parser(
+        "rescore", help="Re-rank every job with the current ranker and profile"
+    )
+    maintenance_rescore.add_argument(
+        "--lock-timeout", type=_nonnegative_timeout, default=0.0
+    )
     maintenance_recover = maintenance_sub.add_parser("recover-stale-runs")
     maintenance_recover.add_argument("--older-than-minutes", type=int, default=180)
     maintenance_recover.add_argument(
@@ -1321,6 +1327,7 @@ def _maintenance_command(
         maintenance_status,
         optimize_database,
         recover_stale_runs_exclusive,
+        rescore_evaluations_exclusive,
     )
 
     command = args.maintenance_command
@@ -1347,6 +1354,13 @@ def _maintenance_command(
             paths.database,
             paths=paths,
             stale_after=timedelta(minutes=args.older_than_minutes),
+            lock_timeout=args.lock_timeout,
+        )
+    elif command == "rescore":
+        result = rescore_evaluations_exclusive(
+            paths.database,
+            paths=paths,
+            config=config,
             lock_timeout=args.lock_timeout,
         )
     elif command == "clean-expired-cache":

@@ -260,6 +260,20 @@ configuration (federal, private, legal-AI, NYC, and Bay Area); a nonzero legacy
 confidently annualized USD compensation. Unknown-period and non-USD figures stay
 visible as warnings and never cause an automatic rejection.
 
+The deterministic score weights fit and gate passability most (30% each), then
+compensation (15%), strategic optionality and workload (10% each), and
+location (5%). Fit counts role families named in the job title far above
+description mentions. `ranking_excluded_title_terms` lists unwanted role
+families (for example `"software engineer"`); a title that names one and no
+target family gets the minimum fit and a `role_family` gate failure.
+`ranking_target_seniority` (`any`, `early`, `mid`, or `senior`) adds a
+seniority gate for title tiers and, when no approved years-of-experience fact
+exists, grades stated experience requirements against that stage. Stated
+requirements the profile cannot confirm, such as a required bar admission,
+cost more than unmentioned ones. After changing these settings or upgrading
+the ranker, `jobby maintenance rescore` re-ranks every job while keeping
+evaluation history and locked manual scores.
+
 `schedule install` is the only operation that activates local scheduling. It
 installs the enabled focused-profile cadence at 7:00 AM and a metadata inventory
 at 6:00 AM Sunday by default. Upgrades and `schedule rebind` never install a
