@@ -11,12 +11,13 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import hashlib
 import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from .analytics import analytics_report
 from .application_workspace import create_contact, create_task
@@ -77,12 +78,19 @@ from .review_queues import (
 from .discovery_service import run_discovery_scan
 from .job_queries import JobListFilters, JobSort, query_jobs_page
 from .sources.base import sanitize_error_message
+from .facade_serialization import (
+    MAX_RESPONSE_BYTES,
+    enforce_response_budget,
+    model_dto,
+)
 
 
 MAX_PAGE = 200
 MAX_DESCRIPTION = 100_000
 DEFAULT_DESCRIPTION = 3_000
 MAX_TEXT = 500_000
+MAX_NESTING_DEPTH = 8
+MAX_LIST_ITEMS = 200
 VALID_FACETS = frozenset({"source", "status", "category", "company", "location"})
 APPROVAL_TTL_SECONDS = 600
 APPROVAL_REQUIRED_ACTORS = frozenset({"mcp_client", "agent", "scheduler"})
@@ -101,6 +109,17 @@ APPROVAL_ACTIONS = frozenset(
         "company.unwatch",
     }
 )
+MUTATION_POLICY: dict[str, dict[str, object]] = {
+    action: {"approval_required_for_non_human": True, "cas": True}
+    for action in APPROVAL_ACTIONS
+}
+MUTATION_POLICY.update(
+    {
+        "review.approve": {"approval_required_for_non_human": False, "cas": True},
+        "review.dismiss": {"approval_required_for_non_human": False, "cas": True},
+        "activity.log": {"approval_required_for_non_human": False, "cas": False},
+    }
+)
 
 
 class FacadeInput(BaseModel):
@@ -117,6 +136,7 @@ class SearchInput(FacadeInput):
     sort: JobSort = JobSort.SCORE_HIGH
     limit: int = Field(default=50, ge=1, le=MAX_PAGE)
     offset: int = Field(default=0, ge=0, le=1_000_000)
+    cursor: str | None = Field(default=None, max_length=4_000)
     full_content: bool = False
 
     @field_validator("query", "company", "location", "category", "source")
@@ -129,7 +149,7 @@ class SearchInput(FacadeInput):
 
 
 class CaptureInput(FacadeInput):
-    url: str | None = None
+    url: str | None = Field(default=None, max_length=8_000)
     company: str | None = None
     title: str | None = None
     location: str | None = None
@@ -141,10 +161,81 @@ class FacadeError(ValueError):
     """A client-safe validation error at the headless boundary."""
 
 
+def _cursor_token(
+    kind: str,
+    identity: str,
+    offset: int,
+    *,
+    after: Mapping[str, Any] | None = None,
+) -> str:
+    payload = {"v": 1, "kind": kind, "identity": identity, "offset": offset}
+    if after is not None:
+        payload["after"] = dict(after)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(encoded).decode().rstrip("=")
+
+
+def _cursor_offset(cursor: str | None, *, kind: str, identity: str) -> int | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str) or not 1 <= len(cursor) <= 4_000:
+        raise ValueError("cursor is invalid or too long")
+    try:
+        encoded = cursor.encode()
+        encoded += b"=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded))
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("cursor is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or payload.get("kind") != kind
+        or payload.get("identity") != identity
+        or isinstance(payload.get("offset"), bool)
+        or not isinstance(payload.get("offset"), int)
+        or not 0 <= payload["offset"] <= 1_000_000
+    ):
+        raise ValueError("cursor does not match current filters or sort")
+    return payload["offset"]
+
+
+def _cursor_after(
+    cursor: str | None, *, kind: str, identity: str
+) -> dict[str, Any] | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str) or not 1 <= len(cursor) <= 4_000:
+        raise ValueError("cursor is invalid or too long")
+    try:
+        encoded = cursor.encode()
+        encoded += b"=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded))
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("cursor is invalid") from exc
+    after = payload.get("after") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or payload.get("kind") != kind
+        or payload.get("identity") != identity
+        or isinstance(payload.get("offset"), bool)
+        or not isinstance(payload.get("offset"), int)
+        or not 0 <= payload["offset"] <= 1_000_000
+    ):
+        raise ValueError("cursor does not match current filters or sort")
+    if after is None:
+        # Offset cursors remain accepted as a compatibility path. New cursors
+        # carry a keyset position and callers prefer that position when present.
+        return None
+    if not isinstance(after, dict):
+        raise ValueError("cursor does not match current filters or sort")
+    return after
+
+
 def _json(value: Any, *, depth: int = 0) -> Any:
     """Convert detached values to bounded JSON-compatible data."""
 
-    if depth > 12:
+    if depth >= MAX_NESTING_DEPTH:
         return "[maximum depth exceeded]"
     if isinstance(value, (datetime,)):
         return value.isoformat()
@@ -153,21 +244,13 @@ def _json(value: Any, *, depth: int = 0) -> Any:
             return value.value
         except Exception:
             pass
-    if hasattr(value, "__table__"):
-        try:
-            return {
-                attribute.key: _json(getattr(value, attribute.key), depth=depth + 1)
-                for attribute in value.__mapper__.column_attrs
-            }
-        except Exception:
-            return str(value)
     if isinstance(value, Mapping):
         return {
             str(key): _json(item, depth=depth + 1)
-            for key, item in list(value.items())[:1000]
+            for key, item in list(value.items())[:MAX_LIST_ITEMS]
         }
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json(item, depth=depth + 1) for item in list(value)[:1000]]
+        return [_json(item, depth=depth + 1) for item in list(value)[:MAX_LIST_ITEMS]]
     if isinstance(value, (str, int, float, bool)) or value is None:
         if isinstance(value, str) and len(value) > MAX_TEXT:
             return (
@@ -234,6 +317,96 @@ def _hash_payload(value: Any) -> str:
             _json(value), sort_keys=True, ensure_ascii=False, separators=(",", ":")
         ).encode()
     ).hexdigest()
+
+
+def _cursor_datetime(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    from datetime import date
+
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+_REVIEW_FIELDS: dict[str, tuple[str, ...]] = {
+    "duplicate": (
+        "id",
+        "job_id",
+        "duplicate_job_id",
+        "rule",
+        "similarity",
+        "confirmed",
+        "resolution",
+        "comparison_identity",
+        "resolved_at",
+        "canonical_group_id",
+        "created_at",
+        "updated_at",
+    ),
+    "import": (
+        "id",
+        "workspace_root",
+        "source_path",
+        "record_key",
+        "reason",
+        "raw_excerpt",
+        "proposed_json",
+        "status",
+        "created_at",
+        "updated_at",
+    ),
+    "company_candidate": (
+        "id",
+        "company_id",
+        "name",
+        "website",
+        "source",
+        "role_filter",
+        "location_filter",
+        "industry_filter",
+        "evidence",
+        "score",
+        "decision",
+        "discovered_at",
+        "created_at",
+        "updated_at",
+    ),
+    "suggestion": (
+        "id",
+        "kind",
+        "application_id",
+        "email_message_id",
+        "external_event_id",
+        "payload",
+        "confidence",
+        "approval_state",
+        "applied_at",
+        "created_at",
+        "updated_at",
+    ),
+}
+
+
+def _review_record(review_type: str, row: object) -> dict[str, Any]:
+    fields = _REVIEW_FIELDS.get(review_type)
+    if fields is None:
+        raise ValueError("unsupported review type")
+    return model_dto(
+        row,
+        fields,
+        limits={"workspace_root": 500, "source_path": 2_000, "raw_excerpt": 5_000},
+    )
+
+
+def _review_hash(review_type: str, row: object) -> str:
+    """Hash the review snapshot used by compare-and-set review mutations."""
+
+    return _hash_payload(
+        {"review_type": review_type, "record": _review_record(review_type, row)}
+    )
 
 
 class ApplicationFacade:
@@ -360,21 +533,36 @@ class ApplicationFacade:
             return None
         if not approval_id:
             raise PermissionError("this mutation requires an approved approval_id")
+        payload_hash = _hash_payload(payload)
+        now = utc_now()
+        # A read followed by an ORM assignment permits two concurrent callers
+        # to observe the same approval.  The conditional UPDATE is the
+        # compare-and-set: exactly one transaction can move approved ->
+        # consumed, and a later mutation cannot consume it again.
+        result = session.execute(
+            update(MutationApproval)
+            .where(
+                MutationApproval.id == approval_id,
+                MutationApproval.actor == self.actor,
+                MutationApproval.action == action,
+                MutationApproval.payload_hash == payload_hash,
+                MutationApproval.status == "approved",
+                MutationApproval.expires_at > now,
+            )
+            .values(status="consumed", consumed_at=now)
+        )
+        if result.rowcount == 1:
+            return approval_id
         row = session.get(MutationApproval, approval_id)
         if row is None:
             raise LookupError("approval intent not found")
         if row.actor != self.actor:
             raise PermissionError("approval intent belongs to another actor")
-        if row.action != action or row.payload_hash != _hash_payload(payload):
+        if row.action != action or row.payload_hash != payload_hash:
             raise ValueError("approval intent does not match this mutation")
-        if row.status != "approved":
-            raise ValueError("approval intent is not approved")
-        if row.expires_at <= utc_now():
-            row.status = "expired"
+        if row.expires_at <= now:
             raise ValueError("approval intent has expired")
-        row.status = "consumed"
-        row.consumed_at = utc_now()
-        return row.id
+        raise ValueError("approval intent is not approved")
 
     def _audit_id(
         self, session: Any, *, entity_id: str | None = None, action: str | None = None
@@ -404,7 +592,7 @@ class ApplicationFacade:
             result.setdefault(
                 "audit_id", self._audit_id(session, entity_id=entity_id, action=action)
             )
-        return result
+        return enforce_response_budget(result, budget=MAX_RESPONSE_BYTES)
 
     # Read-only operations -------------------------------------------------
 
@@ -445,16 +633,19 @@ class ApplicationFacade:
                     .limit(500)
                 )
             ]
-            return {
-                "facets": {
-                    "company": company,
-                    "location": location,
-                    "source": source,
-                    "category": category,
-                    "status": [item.value for item in JobStatus],
+            return enforce_response_budget(
+                {
+                    "facets": {
+                        "company": company,
+                        "location": location,
+                        "source": source,
+                        "category": category,
+                        "status": [item.value for item in JobStatus],
+                    },
+                    "valid_facets": sorted(VALID_FACETS),
                 },
-                "valid_facets": sorted(VALID_FACETS),
-            }
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def search_jobs(
         self, request: SearchInput | Mapping[str, Any] | None = None
@@ -465,6 +656,25 @@ class ApplicationFacade:
             else SearchInput.model_validate(request or {})
         )
         statuses = frozenset(request.statuses) if request.statuses else None
+        identity = _hash_payload(
+            {
+                "query": request.query,
+                "company": request.company,
+                "location": request.location,
+                "category": request.category,
+                "source": request.source,
+                "statuses": sorted(item.value for item in statuses or ()),
+                "sort": request.sort,
+                "full_content": request.full_content,
+            }
+        )
+        cursor_offset = _cursor_offset(request.cursor, kind="jobs", identity=identity)
+        cursor_after = _cursor_after(request.cursor, kind="jobs", identity=identity)
+        offset = (
+            0
+            if cursor_after is not None
+            else (request.offset if cursor_offset is None else cursor_offset)
+        )
         filters = JobListFilters(
             query=request.query,
             company=request.company,
@@ -473,13 +683,20 @@ class ApplicationFacade:
             source=request.source,
             statuses=statuses,
             sort=request.sort,
-            limit=request.limit,
-            offset=request.offset,
+            limit=request.limit + (1 if cursor_after is not None else 0),
+            offset=offset,
+            after=cursor_after,
         )
         with self.database.session() as session:
             page = query_jobs_page(session, filters)
             items = []
-            for item in page.items:
+            page_items = page.items
+            has_extra_keyset_item = (
+                cursor_after is not None and len(page_items) > request.limit
+            )
+            if has_extra_keyset_item:
+                page_items = page_items[: request.limit]
+            for item in page_items:
                 items.append(
                     {
                         "id": item.id,
@@ -501,13 +718,49 @@ class ApplicationFacade:
                         "salary_max": item.salary_max,
                     }
                 )
-            return {
-                "items": items,
-                "total_count": page.total_count,
-                "offset": page.offset,
-                "limit": page.limit,
-                "provenance": {"query": request.query, "sort": request.sort},
-            }
+            has_more = (
+                has_extra_keyset_item
+                if cursor_after is not None
+                else offset + len(items) < page.total_count
+            )
+            last_item = items[-1] if items else None
+            after = (
+                {
+                    "id": last_item["id"],
+                    "score": last_item["score"],
+                    "discovered_at": _cursor_datetime(last_item["discovered_at"]),
+                    "deadline": _cursor_datetime(last_item["deadline"]),
+                    "company": last_item["company"],
+                    "title": last_item["title"],
+                }
+                if last_item is not None
+                else None
+            )
+            return enforce_response_budget(
+                {
+                    "items": items,
+                    "total_count": page.total_count,
+                    "offset": offset,
+                    "limit": request.limit,
+                    "has_more": has_more,
+                    "next_cursor": (
+                        _cursor_token(
+                            "jobs",
+                            identity,
+                            offset + len(items),
+                            after=after,
+                        )
+                        if has_more
+                        else None
+                    ),
+                    "provenance": {
+                        "query": request.query,
+                        "sort": request.sort,
+                        "filter_identity": identity,
+                    },
+                },
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_job(self, job_id: str, *, full_content: bool = False) -> dict[str, Any]:
         with self.database.session() as session:
@@ -538,61 +791,64 @@ class ApplicationFacade:
                 .order_by(Evaluation.updated_at.desc())
                 .limit(1)
             )
-            return {
-                "id": job.id,
-                "title": job.title,
-                "company": {
-                    "id": company.id,
-                    "name": company.name,
-                    "website": company.website,
+            return enforce_response_budget(
+                {
+                    "id": job.id,
+                    "title": job.title,
+                    "company": {
+                        "id": company.id,
+                        "name": company.name,
+                        "website": company.website,
+                    },
+                    "location": (
+                        {
+                            "id": location.id,
+                            "display_name": location.display_name,
+                            "remote": location.remote,
+                        }
+                        if location
+                        else None
+                    ),
+                    "url": job.launch_url or job.canonical_url,
+                    "comparison_url": job.comparison_url,
+                    "source": job.source_primary,
+                    "source_id": job.source_id,
+                    "description": _truncate(job.description, full=full_content),
+                    "status": job.status,
+                    "score": job.latest_score,
+                    "compensation": job.compensation_text,
+                    "salary_min": job.salary_min,
+                    "salary_max": job.salary_max,
+                    "posted_at": job.posted_at,
+                    "deadline": job.deadline,
+                    "discovered_at": job.discovered_at,
+                    "last_seen_at": job.last_seen_at,
+                    "liveness": {
+                        "known": job.liveness_known,
+                        "consecutive_misses": job.consecutive_misses,
+                    },
+                    "evaluation": (
+                        _json(evaluation.components)
+                        | {
+                            "score": evaluation.score,
+                            "explanation": evaluation.explanation,
+                            "warnings": evaluation.warnings,
+                        }
+                        if evaluation
+                        else None
+                    ),
+                    "provenance": [
+                        {
+                            "source": item.source,
+                            "source_id": item.source_job_id,
+                            "url": item.source_url,
+                            "observed_at": item.observed_at,
+                        }
+                        for item in observations
+                    ],
                 },
-                "location": (
-                    {
-                        "id": location.id,
-                        "display_name": location.display_name,
-                        "remote": location.remote,
-                    }
-                    if location
-                    else None
-                ),
-                "url": job.launch_url or job.canonical_url,
-                "comparison_url": job.comparison_url,
-                "source": job.source_primary,
-                "source_id": job.source_id,
-                "description": _truncate(job.description, full=full_content),
-                "status": job.status,
-                "score": job.latest_score,
-                "compensation": job.compensation_text,
-                "salary_min": job.salary_min,
-                "salary_max": job.salary_max,
-                "posted_at": job.posted_at,
-                "deadline": job.deadline,
-                "discovered_at": job.discovered_at,
-                "last_seen_at": job.last_seen_at,
-                "liveness": {
-                    "known": job.liveness_known,
-                    "consecutive_misses": job.consecutive_misses,
-                },
-                "evaluation": (
-                    _json(evaluation.components)
-                    | {
-                        "score": evaluation.score,
-                        "explanation": evaluation.explanation,
-                        "warnings": evaluation.warnings,
-                    }
-                    if evaluation
-                    else None
-                ),
-                "provenance": [
-                    {
-                        "source": item.source,
-                        "source_id": item.source_job_id,
-                        "url": item.source_url,
-                        "observed_at": item.observed_at,
-                    }
-                    for item in observations
-                ],
-            }
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_company(self, company_id: str) -> dict[str, Any]:
         with self.database.session() as session:
@@ -612,22 +868,41 @@ class ApplicationFacade:
                     CompanyWatchlistEntry.company_id == company.id
                 )
             )
-            return {
-                "id": company.id,
-                "name": company.name,
-                "website": company.website,
-                "notes": company.notes,
-                "jobs": [
-                    {
-                        "id": item.id,
-                        "title": item.title,
-                        "status": item.status,
-                        "score": item.latest_score,
-                    }
-                    for item in jobs
-                ],
-                "watchlist": _json(watch) if watch else None,
-            }
+            return enforce_response_budget(
+                {
+                    "id": company.id,
+                    "name": company.name,
+                    "website": company.website,
+                    "notes": company.notes,
+                    "jobs": [
+                        {
+                            "id": item.id,
+                            "title": item.title,
+                            "status": item.status,
+                            "score": item.latest_score,
+                        }
+                        for item in jobs
+                    ],
+                    "watchlist": (
+                        model_dto(
+                            watch,
+                            (
+                                "id",
+                                "company_id",
+                                "criteria",
+                                "cadence_days",
+                                "enabled",
+                                "last_scanned_at",
+                                "created_at",
+                                "updated_at",
+                            ),
+                        )
+                        if watch
+                        else None
+                    ),
+                },
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_latest_scan(self) -> dict[str, Any] | None:
         with self.database.session() as session:
@@ -636,16 +911,56 @@ class ApplicationFacade:
                 .order_by(ScanRun.created_at.desc(), ScanRun.id.desc())
                 .limit(1)
             )
-            return _json(row) if row else None
+            if row is None:
+                return None
+            return enforce_response_budget(
+                model_dto(
+                    row,
+                    (
+                        "id",
+                        "status",
+                        "query",
+                        "requested_sources",
+                        "started_at",
+                        "finished_at",
+                        "discovered_count",
+                        "error_summary",
+                        "source_results",
+                        "created_at",
+                    ),
+                    limits={"error_summary": 2_000},
+                ),
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_source_health(self) -> list[dict[str, Any]]:
         with self.database.session() as session:
-            return [
-                _json(row)
-                for row in session.scalars(
-                    select(SourceHealth).order_by(SourceHealth.source).limit(MAX_PAGE)
-                )
-            ]
+            return enforce_response_budget(
+                [
+                    model_dto(
+                        row,
+                        (
+                            "id",
+                            "source",
+                            "last_attempt_at",
+                            "last_success_at",
+                            "last_complete_at",
+                            "last_result_count",
+                            "last_reported_total",
+                            "failure_streak",
+                            "last_failure_class",
+                            "anomaly_state",
+                        ),
+                        limits={"last_failure_class": 200},
+                    )
+                    for row in session.scalars(
+                        select(SourceHealth)
+                        .order_by(SourceHealth.source)
+                        .limit(MAX_PAGE)
+                    )
+                ],
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_market_fit(self, job_id: str) -> dict[str, Any]:
         with self.database.session() as session:
@@ -657,20 +972,23 @@ class ApplicationFacade:
             )
             if evaluation is None:
                 raise LookupError("market-fit evaluation not found")
-            return {
-                "job_id": job_id,
-                "score": evaluation.score,
-                "components": _json(evaluation.components),
-                "gates": _json(evaluation.gates),
-                "evidence": _json(evaluation.evidence),
-                "warnings": _json(evaluation.warnings),
-                "explanation": evaluation.explanation,
-                "provenance": {
-                    "ranker_version": evaluation.ranker_version,
-                    "evaluation_id": evaluation.id,
-                    "created_at": evaluation.created_at,
+            return enforce_response_budget(
+                {
+                    "job_id": job_id,
+                    "score": evaluation.score,
+                    "components": _json(evaluation.components),
+                    "gates": _json(evaluation.gates),
+                    "evidence": _json(evaluation.evidence),
+                    "warnings": _json(evaluation.warnings),
+                    "explanation": evaluation.explanation,
+                    "provenance": {
+                        "ranker_version": evaluation.ranker_version,
+                        "evaluation_id": evaluation.id,
+                        "created_at": evaluation.created_at,
+                    },
                 },
-            }
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def list_pipeline(
         self,
@@ -678,9 +996,17 @@ class ApplicationFacade:
         stage: ApplicationStage | str | None = None,
         limit: int = MAX_PAGE,
         offset: int = 0,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         if not 1 <= limit <= MAX_PAGE or offset < 0:
             raise ValueError("pipeline pagination is bounded to 1..200 rows")
+        identity = _hash_payload({"stage": str(stage) if stage is not None else None})
+        cursor_offset = _cursor_offset(cursor, kind="applications", identity=identity)
+        cursor_after = _cursor_after(cursor, kind="applications", identity=identity)
+        if cursor_after is not None:
+            offset = 0
+        elif cursor_offset is not None:
+            offset = cursor_offset
         with self.database.session() as session:
             statement = (
                 select(Application, Job, Company)
@@ -695,29 +1021,69 @@ class ApplicationFacade:
                 session.scalar(select(func.count()).select_from(statement.subquery()))
                 or 0
             )
+            if cursor_after is not None:
+                last_updated = datetime.fromisoformat(str(cursor_after["updated_at"]))
+                statement = statement.where(
+                    (Application.updated_at < last_updated)
+                    | (
+                        (Application.updated_at == last_updated)
+                        & (Application.id > str(cursor_after["id"]))
+                    )
+                )
             rows = session.execute(
                 statement.order_by(Application.updated_at.desc(), Application.id)
                 .offset(offset)
-                .limit(limit)
+                .limit(limit + (1 if cursor_after is not None else 0))
             ).all()
-            return {
-                "items": [
-                    {
-                        "id": app.id,
-                        "job_id": job.id,
-                        "company": company.name,
-                        "title": job.title,
-                        "stage": app.current_stage,
-                        "submitted_at": app.submitted_at,
-                        "follow_up_at": app.follow_up_at,
-                        "updated_at": app.updated_at,
-                    }
-                    for app, job, company in rows
-                ],
-                "total_count": total,
-                "offset": offset,
-                "limit": limit,
-            }
+            has_extra_keyset_row = cursor_after is not None and len(rows) > limit
+            if has_extra_keyset_row:
+                rows = rows[:limit]
+            has_more = (
+                has_extra_keyset_row
+                if cursor_after is not None
+                else offset + len(rows) < total
+            )
+            return enforce_response_budget(
+                {
+                    "items": [
+                        {
+                            "id": app.id,
+                            "job_id": job.id,
+                            "company": company.name,
+                            "title": job.title,
+                            "stage": app.current_stage,
+                            "submitted_at": app.submitted_at,
+                            "follow_up_at": app.follow_up_at,
+                            "updated_at": app.updated_at,
+                        }
+                        for app, job, company in rows
+                    ],
+                    "total_count": total,
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": has_more,
+                    "next_cursor": (
+                        _cursor_token(
+                            "applications",
+                            identity,
+                            offset + len(rows),
+                            after=(
+                                {
+                                    "id": rows[-1][0].id,
+                                    "updated_at": _cursor_datetime(
+                                        rows[-1][0].updated_at
+                                    ),
+                                }
+                                if rows
+                                else None
+                            ),
+                        )
+                        if has_more
+                        else None
+                    ),
+                },
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_application(self, application_id: str) -> dict[str, Any]:
         with self.database.session() as session:
@@ -730,58 +1096,129 @@ class ApplicationFacade:
             if row is None:
                 raise LookupError("application not found")
             app, job, company = row
-            return {
-                "id": app.id,
-                "job_id": job.id,
-                "job": {
-                    "title": job.title,
-                    "company": company.name,
-                    "url": job.launch_url or job.canonical_url,
+            return enforce_response_budget(
+                {
+                    "id": app.id,
+                    "job_id": job.id,
+                    "job": {
+                        "title": job.title,
+                        "company": company.name,
+                        "url": job.launch_url or job.canonical_url,
+                    },
+                    "stage": app.current_stage,
+                    "submission_channel": app.submission_channel,
+                    "submitted_at": app.submitted_at,
+                    "follow_up_at": app.follow_up_at,
+                    "notes": app.notes,
+                    "rejection_reason": app.rejection_reason,
+                    "provenance": {
+                        "score": app.applied_score,
+                        "ranker_version": app.applied_ranker_version,
+                        "sources": app.applied_sources,
+                    },
+                    "history": [
+                        model_dto(
+                            event,
+                            (
+                                "id",
+                                "from_stage",
+                                "to_stage",
+                                "occurred_at",
+                                "reason",
+                                "actor",
+                                "source",
+                            ),
+                            limits={"reason": 2_000, "actor": 100, "source": 100},
+                        )
+                        for event in session.scalars(
+                            select(StageEvent)
+                            .where(StageEvent.application_id == app.id)
+                            .order_by(StageEvent.occurred_at, StageEvent.id)
+                            .limit(MAX_LIST_ITEMS)
+                        )
+                    ],
+                    "tasks": [
+                        model_dto(
+                            task,
+                            (
+                                "id",
+                                "title",
+                                "description",
+                                "status",
+                                "due_at",
+                                "completed_at",
+                                "job_id",
+                                "application_id",
+                                "created_at",
+                                "updated_at",
+                            ),
+                            limits={"title": 500, "description": DEFAULT_DESCRIPTION},
+                        )
+                        for task in session.scalars(
+                            select(Task)
+                            .where(Task.application_id == app.id)
+                            .order_by(Task.due_at, Task.id)
+                            .limit(MAX_LIST_ITEMS)
+                        )
+                    ],
+                    "interviews": [
+                        model_dto(
+                            item,
+                            (
+                                "id",
+                                "starts_at",
+                                "ends_at",
+                                "interview_type",
+                                "location_or_link",
+                                "contact_id",
+                                "notes",
+                                "created_at",
+                                "updated_at",
+                            ),
+                            limits={
+                                "location_or_link": 2_000,
+                                "notes": DEFAULT_DESCRIPTION,
+                            },
+                        )
+                        for item in session.scalars(
+                            select(Interview)
+                            .where(Interview.application_id == app.id)
+                            .order_by(Interview.starts_at, Interview.id)
+                            .limit(MAX_LIST_ITEMS)
+                        )
+                    ],
+                    "interview_sessions": [
+                        model_dto(
+                            item,
+                            (
+                                "id",
+                                "interview_id",
+                                "application_id",
+                                "session_type",
+                                "started_at",
+                                "ended_at",
+                                "role_focus",
+                                "notes",
+                                "retrospective",
+                                "outcome",
+                                "created_at",
+                                "updated_at",
+                            ),
+                            limits={
+                                "notes": DEFAULT_DESCRIPTION,
+                                "retrospective": DEFAULT_DESCRIPTION,
+                            },
+                        )
+                        for item in session.scalars(
+                            select(InterviewSession)
+                            .where(InterviewSession.application_id == app.id)
+                            .order_by(InterviewSession.started_at, InterviewSession.id)
+                            .limit(MAX_LIST_ITEMS)
+                        )
+                    ],
                 },
-                "stage": app.current_stage,
-                "submission_channel": app.submission_channel,
-                "submitted_at": app.submitted_at,
-                "follow_up_at": app.follow_up_at,
-                "notes": app.notes,
-                "rejection_reason": app.rejection_reason,
-                "provenance": {
-                    "score": app.applied_score,
-                    "ranker_version": app.applied_ranker_version,
-                    "sources": app.applied_sources,
-                },
-                "history": [
-                    _json(event)
-                    for event in session.scalars(
-                        select(StageEvent)
-                        .where(StageEvent.application_id == app.id)
-                        .order_by(StageEvent.occurred_at, StageEvent.id)
-                    )
-                ],
-                "tasks": [
-                    _json(task)
-                    for task in session.scalars(
-                        select(Task)
-                        .where(Task.application_id == app.id)
-                        .order_by(Task.due_at, Task.id)
-                    )
-                ],
-                "interviews": [
-                    _json(item)
-                    for item in session.scalars(
-                        select(Interview)
-                        .where(Interview.application_id == app.id)
-                        .order_by(Interview.starts_at, Interview.id)
-                    )
-                ],
-                "interview_sessions": [
-                    _json(item)
-                    for item in session.scalars(
-                        select(InterviewSession)
-                        .where(InterviewSession.application_id == app.id)
-                        .order_by(InterviewSession.started_at, InterviewSession.id)
-                    )
-                ],
-            }
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def list_tasks(
         self,
@@ -789,25 +1226,119 @@ class ApplicationFacade:
         status: TaskStatus | str | None = None,
         limit: int = MAX_PAGE,
         offset: int = 0,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         if not 1 <= limit <= MAX_PAGE or offset < 0:
             raise ValueError("task pagination is bounded to 1..200 rows")
+        identity = _hash_payload(
+            {"status": str(status) if status is not None else None}
+        )
+        cursor_offset = _cursor_offset(cursor, kind="tasks", identity=identity)
+        cursor_after = _cursor_after(cursor, kind="tasks", identity=identity)
+        if cursor_after is not None:
+            offset = 0
+        elif cursor_offset is not None:
+            offset = cursor_offset
         with self.database.session() as session:
             statement = select(Task)
             if status is not None:
                 statement = statement.where(Task.status == TaskStatus(status))
+            total = int(
+                session.scalar(select(func.count()).select_from(statement.subquery()))
+                or 0
+            )
+            if cursor_after is not None:
+                last_id = str(cursor_after["id"])
+                last_created = datetime.fromisoformat(str(cursor_after["created_at"]))
+                last_due = cursor_after.get("due_at")
+                if last_due is None:
+                    statement = statement.where(
+                        Task.due_at.is_(None)
+                        & (
+                            (Task.created_at > last_created)
+                            | ((Task.created_at == last_created) & (Task.id > last_id))
+                        )
+                    )
+                else:
+                    due = datetime.fromisoformat(str(last_due))
+                    statement = statement.where(
+                        (Task.due_at > due)
+                        | (
+                            (Task.due_at == due)
+                            & (
+                                (Task.created_at > last_created)
+                                | (
+                                    (Task.created_at == last_created)
+                                    & (Task.id > last_id)
+                                )
+                            )
+                        )
+                    )
             rows = list(
                 session.scalars(
                     statement.order_by(Task.due_at, Task.created_at, Task.id)
                     .offset(offset)
-                    .limit(limit)
+                    .limit(limit + (1 if cursor_after is not None else 0))
                 )
             )
-            return {
-                "items": [_json(row) for row in rows],
-                "limit": limit,
-                "offset": offset,
-            }
+            has_extra_keyset_row = cursor_after is not None and len(rows) > limit
+            if has_extra_keyset_row:
+                rows = rows[:limit]
+            return enforce_response_budget(
+                {
+                    "items": [
+                        model_dto(
+                            row,
+                            (
+                                "id",
+                                "title",
+                                "description",
+                                "status",
+                                "due_at",
+                                "completed_at",
+                                "job_id",
+                                "application_id",
+                                "automation_key",
+                                "created_at",
+                                "updated_at",
+                            ),
+                            limits={"title": 500, "description": DEFAULT_DESCRIPTION},
+                        )
+                        for row in rows
+                    ],
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": (
+                        has_extra_keyset_row
+                        if cursor_after is not None
+                        else offset + len(rows) < total
+                    ),
+                    "next_cursor": (
+                        _cursor_token(
+                            "tasks",
+                            identity,
+                            offset + len(rows),
+                            after=(
+                                {
+                                    "id": rows[-1].id,
+                                    "due_at": _cursor_datetime(rows[-1].due_at),
+                                    "created_at": _cursor_datetime(rows[-1].created_at),
+                                }
+                                if rows
+                                else None
+                            ),
+                        )
+                        if (
+                            has_extra_keyset_row
+                            if cursor_after is not None
+                            else offset + len(rows) < total
+                        )
+                        else None
+                    ),
+                    "total_count": total,
+                },
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def list_contacts(
         self, *, company_id: str | None = None, limit: int = MAX_PAGE
@@ -817,12 +1348,35 @@ class ApplicationFacade:
             statement = select(Contact)
             if company_id:
                 statement = statement.where(Contact.company_id == company_id)
-            return [
-                _json(row)
-                for row in session.scalars(
-                    statement.order_by(Contact.name).limit(min(limit, MAX_PAGE))
-                )
-            ]
+            return enforce_response_budget(
+                [
+                    model_dto(
+                        row,
+                        (
+                            "id",
+                            "company_id",
+                            "name",
+                            "email",
+                            "title",
+                            "linkedin_url",
+                            "notes",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        limits={
+                            "name": 300,
+                            "email": 500,
+                            "title": 300,
+                            "linkedin_url": 2_000,
+                            "notes": DEFAULT_DESCRIPTION,
+                        },
+                    )
+                    for row in session.scalars(
+                        statement.order_by(Contact.name).limit(min(limit, MAX_PAGE))
+                    )
+                ],
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def create_contact(
         self,
@@ -872,58 +1426,267 @@ class ApplicationFacade:
     ) -> list[dict[str, Any]]:
         limit = _bounded_limit(limit, label="alert")
         with self.database.session() as session:
-            return [
-                _json(row)
-                for row in list_alert_inbox(
-                    session, unread_only=unread_only, limit=min(limit, MAX_PAGE)
-                )
-            ]
+            return enforce_response_budget(
+                [
+                    model_dto(
+                        row,
+                        (
+                            "id",
+                            "severity",
+                            "title",
+                            "message",
+                            "job_id",
+                            "application_id",
+                            "acknowledged_at",
+                            "created_at",
+                            "updated_at",
+                            "fingerprint",
+                            "recurrence_count",
+                            "last_recurred_at",
+                            "snoozed_until",
+                            "resolved_at",
+                            "resolution_reason",
+                            "entity_type",
+                            "entity_id",
+                        ),
+                        limits={
+                            "title": 500,
+                            "message": 5_000,
+                            "resolution_reason": 2_000,
+                        },
+                    )
+                    for row in list_alert_inbox(
+                        session, unread_only=unread_only, limit=min(limit, MAX_PAGE)
+                    )
+                ],
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def list_pending_reviews(self, *, limit: int = MAX_PAGE) -> list[dict[str, Any]]:
+        return self.list_pending_reviews_page(limit=limit)["items"]
+
+    def list_pending_reviews_page(
+        self, *, limit: int = MAX_PAGE, cursor: str | None = None
+    ) -> dict[str, Any]:
         if not 1 <= limit <= MAX_PAGE:
             raise ValueError("review pagination is bounded to 1..200 rows")
+        identity = _hash_payload({"queue": "pending_reviews"})
+        cursor_offset = _cursor_offset(cursor, kind="reviews", identity=identity)
+        cursor_after = _cursor_after(cursor, kind="reviews", identity=identity)
+        offset = 0 if cursor_after is not None else (cursor_offset or 0)
+        fetch_limit = (
+            MAX_PAGE + 1 if cursor_after is not None else min(MAX_PAGE, offset + limit)
+        )
         with self.database.session() as session:
+            after_timestamp = (
+                datetime.fromisoformat(str(cursor_after["timestamp"]))
+                if cursor_after is not None
+                else None
+            )
+            after_id = str(cursor_after["id"]) if cursor_after is not None else None
+            duplicate_statement = select(DuplicateRelationship).where(
+                DuplicateRelationship.resolution == "pending"
+            )
+            import_statement = select(ImportReview).where(
+                ImportReview.status == "pending"
+            )
+            candidate_statement = select(CompanyCandidate).where(
+                CompanyCandidate.decision == "pending"
+            )
+            suggestion_statement = select(ExternalSuggestion).where(
+                ExternalSuggestion.approval_state == ApprovalState.PENDING
+            )
+            if after_timestamp is not None and after_id is not None:
+                duplicate_statement = duplicate_statement.where(
+                    (DuplicateRelationship.created_at > after_timestamp)
+                    | (
+                        (DuplicateRelationship.created_at == after_timestamp)
+                        & (DuplicateRelationship.id > after_id)
+                    )
+                )
+                import_statement = import_statement.where(
+                    (ImportReview.created_at > after_timestamp)
+                    | (
+                        (ImportReview.created_at == after_timestamp)
+                        & (ImportReview.id > after_id)
+                    )
+                )
+                candidate_statement = candidate_statement.where(
+                    (CompanyCandidate.discovered_at > after_timestamp)
+                    | (
+                        (CompanyCandidate.discovered_at == after_timestamp)
+                        & (CompanyCandidate.id > after_id)
+                    )
+                )
+                suggestion_statement = suggestion_statement.where(
+                    (ExternalSuggestion.created_at > after_timestamp)
+                    | (
+                        (ExternalSuggestion.created_at == after_timestamp)
+                        & (ExternalSuggestion.id > after_id)
+                    )
+                )
             duplicates = list(
                 session.scalars(
-                    select(DuplicateRelationship)
-                    .where(DuplicateRelationship.resolution == "pending")
-                    .order_by(DuplicateRelationship.created_at)
-                    .limit(limit)
+                    duplicate_statement.order_by(
+                        DuplicateRelationship.created_at, DuplicateRelationship.id
+                    ).limit(fetch_limit)
                 )
             )
             imports = list(
                 session.scalars(
-                    select(ImportReview)
-                    .where(ImportReview.status == "pending")
-                    .order_by(ImportReview.created_at)
-                    .limit(limit)
+                    import_statement.order_by(
+                        ImportReview.created_at, ImportReview.id
+                    ).limit(fetch_limit)
                 )
             )
             candidates = list(
                 session.scalars(
-                    select(CompanyCandidate)
-                    .where(CompanyCandidate.decision == "pending")
-                    .order_by(CompanyCandidate.discovered_at)
-                    .limit(limit)
+                    candidate_statement.order_by(
+                        CompanyCandidate.discovered_at, CompanyCandidate.id
+                    ).limit(fetch_limit)
                 )
             )
             suggestions = list(
                 session.scalars(
-                    select(ExternalSuggestion)
-                    .where(ExternalSuggestion.approval_state == ApprovalState.PENDING)
-                    .order_by(ExternalSuggestion.created_at)
-                    .limit(limit)
+                    suggestion_statement.order_by(
+                        ExternalSuggestion.created_at, ExternalSuggestion.id
+                    ).limit(fetch_limit)
                 )
             )
-            return (
-                [{"review_type": "duplicate", **_json(row)} for row in duplicates]
-                + [{"review_type": "import", **_json(row)} for row in imports]
+            items = (
+                [
+                    {
+                        "review_type": "duplicate",
+                        **_review_record("duplicate", row),
+                        "review_hash": _review_hash("duplicate", row),
+                    }
+                    for row in duplicates
+                ]
                 + [
-                    {"review_type": "company_candidate", **_json(row)}
+                    {
+                        "review_type": "import",
+                        **_review_record("import", row),
+                        "review_hash": _review_hash("import", row),
+                    }
+                    for row in imports
+                ]
+                + [
+                    {
+                        "review_type": "company_candidate",
+                        **_review_record("company_candidate", row),
+                        "review_hash": _review_hash("company_candidate", row),
+                    }
                     for row in candidates
                 ]
-                + [{"review_type": "suggestion", **_json(row)} for row in suggestions]
-            )[:MAX_PAGE]
+                + [
+                    {
+                        "review_type": "suggestion",
+                        **_review_record("suggestion", row),
+                        "review_hash": _review_hash("suggestion", row),
+                    }
+                    for row in suggestions
+                ]
+            )
+            # Fetching ``limit`` from each queue and merging by timestamp is
+            # deterministic and avoids a type-order bias in the first page.
+            items.sort(
+                key=lambda item: (
+                    str(
+                        item.get("created_at")
+                        or item.get("discovered_at")
+                        or item.get("updated_at")
+                        or ""
+                    ),
+                    str(item.get("id") or ""),
+                )
+            )
+            if cursor_after is not None:
+                after_timestamp = str(cursor_after.get("timestamp") or "")
+                after_id = str(cursor_after.get("id") or "")
+                items = [
+                    item
+                    for item in items
+                    if (
+                        str(
+                            item.get("created_at")
+                            or item.get("discovered_at")
+                            or item.get("updated_at")
+                            or ""
+                        ),
+                        str(item.get("id") or ""),
+                    )
+                    > (after_timestamp, after_id)
+                ]
+            counts = {
+                "duplicate": session.scalar(
+                    select(func.count())
+                    .select_from(DuplicateRelationship)
+                    .where(DuplicateRelationship.resolution == "pending")
+                ),
+                "import": session.scalar(
+                    select(func.count())
+                    .select_from(ImportReview)
+                    .where(ImportReview.status == "pending")
+                ),
+                "company_candidate": session.scalar(
+                    select(func.count())
+                    .select_from(CompanyCandidate)
+                    .where(CompanyCandidate.decision == "pending")
+                ),
+                "suggestion": session.scalar(
+                    select(func.count())
+                    .select_from(ExternalSuggestion)
+                    .where(ExternalSuggestion.approval_state == ApprovalState.PENDING)
+                ),
+            }
+            total_count = sum(int(value or 0) for value in counts.values())
+            page_items = items[offset : offset + limit]
+            has_more = (
+                len(items) > offset + limit
+                if cursor_after is not None
+                else offset + len(page_items) < total_count
+            )
+            return enforce_response_budget(
+                {
+                    "items": page_items,
+                    "has_more": has_more,
+                    "next_cursor": (
+                        _cursor_token(
+                            "reviews",
+                            identity,
+                            offset + len(page_items),
+                            after=(
+                                {
+                                    "id": page_items[-1]["id"],
+                                    "timestamp": str(
+                                        page_items[-1].get("created_at")
+                                        or page_items[-1].get("discovered_at")
+                                        or page_items[-1].get("updated_at")
+                                        or ""
+                                    ),
+                                }
+                                if page_items
+                                else None
+                            ),
+                        )
+                        if has_more
+                        else None
+                    ),
+                    "omission_counts": {
+                        key: max(
+                            0,
+                            int(value or 0)
+                            - sum(
+                                1
+                                for item in page_items
+                                if item.get("review_type") == key
+                            ),
+                        )
+                        for key, value in counts.items()
+                    },
+                },
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def list_documents(
         self,
@@ -932,30 +1695,143 @@ class ApplicationFacade:
         limit: int = MAX_PAGE,
         full_content: bool = False,
     ) -> list[dict[str, Any]]:
+        return self.list_documents_page(
+            status=status, limit=limit, full_content=full_content
+        )["items"]
+
+    def get_document(
+        self, document_id: str, *, full_content: bool = False
+    ) -> dict[str, Any]:
+        """Retrieve one document by its indexed primary key."""
+
+        with self.database.session() as session:
+            row = session.get(DocumentVersion, document_id)
+            if row is None:
+                raise LookupError("document not found")
+            return enforce_response_budget(
+                self._document_dto(row, full_content=full_content),
+                budget=MAX_RESPONSE_BYTES,
+            )
+
+    @staticmethod
+    def _document_dto(row: DocumentVersion, *, full_content: bool) -> dict[str, Any]:
+        payload = model_dto(
+            row,
+            (
+                "id",
+                "kind",
+                "name",
+                "version",
+                "parent_id",
+                "job_id",
+                "status",
+                "approval_state",
+                "is_canonical",
+                "content_hash",
+                "provenance",
+                "diff_data",
+                "validation",
+                "created_at",
+                "updated_at",
+            ),
+            limits={"name": 500},
+        )
+        content = _truncate(row.content_markdown, full=full_content)
+        payload["content_markdown"] = content
+        payload["content_truncated"] = content != row.content_markdown
+        if content != row.content_markdown:
+            payload["content_omitted_chars"] = max(
+                0, len(row.content_markdown) - len(content or "")
+            )
+        return payload
+
+    def list_documents_page(
+        self,
+        *,
+        status: DocumentStatus | str | None = None,
+        limit: int = MAX_PAGE,
+        full_content: bool = False,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         limit = _bounded_limit(limit, label="document")
+        identity = _hash_payload(
+            {
+                "status": str(status) if status is not None else None,
+                "full_content": full_content,
+            }
+        )
+        cursor_offset = _cursor_offset(cursor, kind="documents", identity=identity)
+        cursor_after = _cursor_after(cursor, kind="documents", identity=identity)
+        offset = 0 if cursor_after is not None else (cursor_offset or 0)
         with self.database.session() as session:
             statement = select(DocumentVersion)
             if status is not None:
                 statement = statement.where(
                     DocumentVersion.status == DocumentStatus(status)
                 )
-            result = []
+            total = int(
+                session.scalar(select(func.count()).select_from(statement.subquery()))
+                or 0
+            )
+            if cursor_after is not None:
+                last_updated = datetime.fromisoformat(str(cursor_after["updated_at"]))
+                statement = statement.where(
+                    (DocumentVersion.updated_at < last_updated)
+                    | (
+                        (DocumentVersion.updated_at == last_updated)
+                        & (DocumentVersion.id > str(cursor_after["id"]))
+                    )
+                )
+            result: list[dict[str, Any]] = []
             for row in session.scalars(
                 statement.order_by(
                     DocumentVersion.updated_at.desc(), DocumentVersion.id
-                ).limit(min(limit, MAX_PAGE))
+                )
+                .offset(offset)
+                .limit(limit + (1 if cursor_after is not None else 0))
             ):
-                payload = _json(row)
-                if isinstance(payload, dict):
-                    payload["content_markdown"] = _truncate(
-                        row.content_markdown, full=full_content
-                    )
-                result.append(payload)
-            return result
+                result.append(self._document_dto(row, full_content=full_content))
+            has_extra_keyset_item = cursor_after is not None and len(result) > limit
+            if has_extra_keyset_item:
+                result = result[:limit]
+            has_more = (
+                has_extra_keyset_item
+                if cursor_after is not None
+                else offset + len(result) < total
+            )
+            return enforce_response_budget(
+                {
+                    "items": result,
+                    "has_more": has_more,
+                    "next_cursor": (
+                        _cursor_token(
+                            "documents",
+                            identity,
+                            offset + len(result),
+                            after=(
+                                {
+                                    "id": result[-1]["id"],
+                                    "updated_at": _cursor_datetime(
+                                        result[-1]["updated_at"]
+                                    ),
+                                }
+                                if result
+                                else None
+                            ),
+                        )
+                        if has_more
+                        else None
+                    ),
+                    "omitted_count": max(0, total - offset - len(result)),
+                },
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def get_analytics(self) -> dict[str, Any]:
         with self.database.session() as session:
-            return _json(analytics_report(session))
+            return enforce_response_budget(
+                _json(analytics_report(session)), budget=MAX_RESPONSE_BYTES
+            )
 
     def list_questions(
         self, *, role_focus: str | None = None, limit: int = MAX_PAGE
@@ -967,14 +1843,31 @@ class ApplicationFacade:
             )
             if role_focus:
                 statement = statement.where(InterviewQuestion.role_focus == role_focus)
-            return [
-                _json(row)
-                for row in session.scalars(
-                    statement.order_by(InterviewQuestion.updated_at.desc()).limit(
-                        min(limit, MAX_PAGE)
+            return enforce_response_budget(
+                [
+                    model_dto(
+                        row,
+                        (
+                            "id",
+                            "prompt",
+                            "role_focus",
+                            "tags",
+                            "skills",
+                            "evidence_keys",
+                            "active",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        limits={"prompt": 5_000, "role_focus": 300},
                     )
-                )
-            ]
+                    for row in session.scalars(
+                        statement.order_by(InterviewQuestion.updated_at.desc()).limit(
+                            min(limit, MAX_PAGE)
+                        )
+                    )
+                ],
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def list_interviews(
         self, *, application_id: str | None = None, limit: int = MAX_PAGE
@@ -985,7 +1878,29 @@ class ApplicationFacade:
             if application_id:
                 statement = statement.where(Interview.application_id == application_id)
             interviews = [
-                {"record_type": "interview", **_json(row)}
+                {
+                    "record_type": "interview",
+                    **model_dto(
+                        row,
+                        (
+                            "id",
+                            "application_id",
+                            "starts_at",
+                            "ends_at",
+                            "interview_type",
+                            "location_or_link",
+                            "contact_id",
+                            "notes",
+                            "calendar_event_id",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        limits={
+                            "location_or_link": 2_000,
+                            "notes": DEFAULT_DESCRIPTION,
+                        },
+                    ),
+                }
                 for row in session.scalars(
                     statement.order_by(Interview.starts_at).limit(limit)
                 )
@@ -996,7 +1911,30 @@ class ApplicationFacade:
                     InterviewSession.application_id == application_id
                 )
             sessions = [
-                {"record_type": "session", **_json(row)}
+                {
+                    "record_type": "session",
+                    **model_dto(
+                        row,
+                        (
+                            "id",
+                            "application_id",
+                            "interview_id",
+                            "session_type",
+                            "role_focus",
+                            "started_at",
+                            "notes",
+                            "retrospective",
+                            "outcome",
+                            "follow_up_task_id",
+                            "created_at",
+                            "updated_at",
+                        ),
+                        limits={
+                            "notes": DEFAULT_DESCRIPTION,
+                            "retrospective": DEFAULT_DESCRIPTION,
+                        },
+                    ),
+                }
                 for row in session.scalars(
                     session_statement.order_by(InterviewSession.started_at).limit(limit)
                 )
@@ -1007,7 +1945,7 @@ class ApplicationFacade:
                     item.get("starts_at") or item.get("started_at") or ""
                 )
             )
-            return combined[:limit]
+            return enforce_response_budget(combined[:limit], budget=MAX_RESPONSE_BYTES)
 
     def create_interview(
         self,
@@ -1069,12 +2007,32 @@ class ApplicationFacade:
             statement = select(Offer)
             if application_id:
                 statement = statement.where(Offer.application_id == application_id)
-            return [
-                _json(row)
-                for row in session.scalars(
-                    statement.order_by(Offer.offered_at).limit(limit)
-                )
-            ]
+            return enforce_response_budget(
+                [
+                    model_dto(
+                        row,
+                        (
+                            "id",
+                            "application_id",
+                            "base_salary",
+                            "annual_bonus",
+                            "annualized_equity",
+                            "currency",
+                            "cost_of_living_index",
+                            "stress_score",
+                            "terms",
+                            "decision",
+                            "offered_at",
+                            "created_at",
+                            "updated_at",
+                        ),
+                    )
+                    for row in session.scalars(
+                        statement.order_by(Offer.offered_at).limit(limit)
+                    )
+                ],
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     # Controlled actions ---------------------------------------------------
 
@@ -1213,7 +2171,25 @@ class ApplicationFacade:
             row = session.get(OperationRun, operation_id)
             if row is None:
                 raise LookupError("operation not found")
-            return _json(row)
+            return enforce_response_budget(
+                model_dto(
+                    row,
+                    (
+                        "id",
+                        "kind",
+                        "status",
+                        "request_json",
+                        "result_json",
+                        "error",
+                        "started_at",
+                        "finished_at",
+                        "created_at",
+                        "updated_at",
+                    ),
+                    limits={"error": 2_000},
+                ),
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def preview_capture(
         self, request: CaptureInput | Mapping[str, Any]
@@ -1224,7 +2200,9 @@ class ApplicationFacade:
             else CaptureInput.model_validate(request)
         )
         preview = preview_capture(self.database, **request.model_dump())
-        return _json(preview.model_dump(mode="json"))
+        return enforce_response_budget(
+            _json(preview.model_dump(mode="json")), budget=MAX_RESPONSE_BYTES
+        )
 
     def save_captured_job(
         self, preview: CapturePreview | Mapping[str, Any]
@@ -1384,6 +2362,18 @@ class ApplicationFacade:
         entity_id: str | None = None,
         detail: str | None = None,
     ) -> dict[str, Any]:
+        for field, value, limit in (
+            ("action", action, 200),
+            ("entity_type", entity_type, 100),
+            ("entity_id", entity_id, 100),
+            ("detail", detail, 20_000),
+        ):
+            if value is None and field in {"entity_id", "detail"}:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a non-empty string")
+            if len(value) > limit or any(ord(char) < 32 for char in value):
+                raise ValueError(f"{field} exceeds its safety limit")
         with self.database.session() as session:
             event = record_audit(
                 session,
@@ -1394,7 +2384,10 @@ class ApplicationFacade:
                 detail=detail,
             )
             session.flush()
-            return {"audit_id": event.id, "state": "recorded"}
+            return enforce_response_budget(
+                {"audit_id": event.id, "state": "recorded"},
+                budget=MAX_RESPONSE_BYTES,
+            )
 
     def create_document_draft(
         self,
@@ -1474,9 +2467,14 @@ class ApplicationFacade:
         *,
         review_type: str = "duplicate",
         canonical_job_id: str | None = None,
+        expected_hash: str | None = None,
     ) -> dict[str, Any]:
         with self.database.session() as session:
             if review_type == "duplicate":
+                current = session.get(DuplicateRelationship, review_id)
+                if current is None:
+                    raise LookupError("review not found")
+                self._assert_review_hash(review_type, current, expected_hash)
                 row = confirm_duplicate(
                     session, review_id, canonical_job_id=canonical_job_id
                 )
@@ -1499,6 +2497,7 @@ class ApplicationFacade:
                 row = session.get(ImportReview, review_id)
                 if row is None:
                     raise LookupError("review not found")
+                self._assert_review_hash(review_type, row, expected_hash)
                 row.status = ImportReviewStatus.RESOLVED
                 event = record_audit(
                     session,
@@ -1517,6 +2516,7 @@ class ApplicationFacade:
                 candidate = session.get(CompanyCandidate, review_id)
                 if candidate is None:
                     raise LookupError("company candidate not found")
+                self._assert_review_hash(review_type, candidate, expected_hash)
                 if candidate.decision != "pending":
                     raise ValueError("company candidate has already been reviewed")
                 company = session.scalar(
@@ -1550,6 +2550,10 @@ class ApplicationFacade:
                     "audit_id": event.id,
                 }
             if review_type == "suggestion":
+                suggestion = session.get(ExternalSuggestion, review_id)
+                if suggestion is None:
+                    raise LookupError("suggestion not found")
+                self._assert_review_hash(review_type, suggestion, expected_hash)
                 result = apply_external_suggestion(
                     session, review_id, approved=True, actor=self.actor
                 )
@@ -1577,26 +2581,37 @@ class ApplicationFacade:
         *,
         review_type: str = "duplicate",
         reason: str | None = None,
+        expected_hash: str | None = None,
     ) -> dict[str, Any]:
         with self.database.session() as session:
             if review_type == "duplicate":
+                current = session.get(DuplicateRelationship, review_id)
+                if current is None:
+                    raise LookupError("review not found")
+                self._assert_review_hash(review_type, current, expected_hash)
                 row = dismiss_duplicate(session, review_id)
                 entity_type = "duplicate_relationship"
             elif review_type == "import":
                 row = session.get(ImportReview, review_id)
                 if row is None:
                     raise LookupError("review not found")
+                self._assert_review_hash(review_type, row, expected_hash)
                 row.status = ImportReviewStatus.DISMISSED
                 entity_type = "import_review"
             elif review_type == "company_candidate":
                 row = session.get(CompanyCandidate, review_id)
                 if row is None:
                     raise LookupError("company candidate not found")
+                self._assert_review_hash(review_type, row, expected_hash)
                 if row.decision != "pending":
                     raise ValueError("company candidate has already been reviewed")
                 row.decision = "dismissed"
                 entity_type = "company_candidate"
             elif review_type == "suggestion":
+                current = session.get(ExternalSuggestion, review_id)
+                if current is None:
+                    raise LookupError("suggestion not found")
+                self._assert_review_hash(review_type, current, expected_hash)
                 apply_external_suggestion(
                     session, review_id, approved=False, actor=self.actor
                 )
@@ -1616,6 +2631,16 @@ class ApplicationFacade:
             )
             session.flush()
             return {"review_id": review_id, "state": "dismissed", "audit_id": event.id}
+
+    @staticmethod
+    def _assert_review_hash(
+        review_type: str, row: object, expected_hash: str | None
+    ) -> None:
+        if expected_hash is None:
+            return
+        actual = _review_hash(review_type, row)
+        if actual != expected_hash:
+            raise ValueError("review is stale; refresh before applying this mutation")
 
     def create_interview_question(
         self,
@@ -1799,8 +2824,9 @@ class ApplicationFacade:
         self, *, application_id: str | None = None
     ) -> list[dict[str, Any]]:
         with self.database.session() as session:
-            return _json(
-                compare_persisted_offers(session, application_id=application_id)
+            return enforce_response_budget(
+                _json(compare_persisted_offers(session, application_id=application_id)),
+                budget=MAX_RESPONSE_BYTES,
             )
 
     def create_offer(

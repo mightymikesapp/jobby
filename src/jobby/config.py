@@ -319,6 +319,14 @@ class CatalogBoard(BaseModel):
         )
 
 
+class ProviderCatalogBoard(CatalogBoard):
+    """Typed provider configuration for adapters with an explicit contract."""
+
+    contract_version: str = Field(default="1", min_length=1, max_length=40)
+    page_size: int = Field(default=100, ge=1, le=1_000)
+    max_pages: int = Field(default=100, ge=1, le=1_000)
+
+
 def _default_workday_boards() -> dict[BoardSlug, WorkdayBoard]:
     return {
         "nvidia": WorkdayBoard(
@@ -382,11 +390,11 @@ class SourceSettings(BaseModel):
     smartrecruiters: dict[BoardSlug, SmartRecruitersBoard] = Field(default_factory=dict)
     icims: dict[BoardSlug, ICIMSBoard] = Field(default_factory=dict)
     taleo: dict[BoardSlug, TaleoBoard] = Field(default_factory=dict)
-    eightfold: dict[BoardSlug, CatalogBoard] = Field(default_factory=dict)
-    oracle_hcm: dict[BoardSlug, CatalogBoard] = Field(default_factory=dict)
-    rippling: dict[BoardSlug, CatalogBoard] = Field(default_factory=dict)
-    paylocity: dict[BoardSlug, CatalogBoard] = Field(default_factory=dict)
-    freehire: dict[BoardSlug, CatalogBoard] = Field(default_factory=dict)
+    eightfold: dict[BoardSlug, ProviderCatalogBoard] = Field(default_factory=dict)
+    oracle_hcm: dict[BoardSlug, ProviderCatalogBoard] = Field(default_factory=dict)
+    rippling: dict[BoardSlug, ProviderCatalogBoard] = Field(default_factory=dict)
+    paylocity: dict[BoardSlug, ProviderCatalogBoard] = Field(default_factory=dict)
+    freehire: dict[BoardSlug, ProviderCatalogBoard] = Field(default_factory=dict)
     workday: dict[BoardSlug, WorkdayBoard] = Field(
         default_factory=_default_workday_boards
     )
@@ -739,6 +747,7 @@ __all__ = [
     "SecretStoreError",
     "SmartRecruitersBoard",
     "SourceSettings",
+    "ProviderCatalogBoard",
     "ICIMSBoard",
     "TaleoBoard",
     "WorkdayBoard",

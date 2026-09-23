@@ -24,6 +24,7 @@ from jobby.sources.catalog import (
     FreehireSource,
     OracleHCMSource,
     PaylocitySource,
+    ProviderCatalogSource,
     RipplingSource,
 )
 from jobby.sources.registry import BUILTIN_SOURCES, DEFAULT_REGISTRY, SourceRegistry
@@ -42,6 +43,7 @@ __all__ = [
     "LeverSource",
     "OracleHCMSource",
     "PaylocitySource",
+    "ProviderCatalogSource",
     "RipplingSource",
     "SmartRecruitersSource",
     "TaleoSource",

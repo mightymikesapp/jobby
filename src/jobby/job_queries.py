@@ -93,6 +93,9 @@ class JobListFilters(BaseModel):
     sort: JobSort = JobSort.SCORE_HIGH
     limit: int = Field(default=500, ge=1, le=1000)
     offset: int = Field(default=0, ge=0, le=1_000_000)
+    # Internal keyset position. The public facade carries this in a signed-
+    # by-hash opaque cursor and never exposes this mapping as an input field.
+    after: dict[str, Any] | None = None
 
     @field_validator("query", "company", "location")
     @classmethod
@@ -396,7 +399,8 @@ def query_jobs_page(
     """Return a detached page and an uncapped count using the same filters."""
 
     filters = filters or JobListFilters()
-    count_statement = _filtered_statement(filters, session=session).add_columns(
+    count_filters = filters.model_copy(update={"after": None, "offset": 0})
+    count_statement = _filtered_statement(count_filters, session=session).add_columns(
         func.count(Job.id)
     )
     total_count = int(session.scalar(count_statement) or 0)
@@ -601,7 +605,106 @@ def _filtered_statement(filters: JobListFilters, *, session: Session | None = No
     if filters.statuses is not None:
         statement = statement.where(Job.status.in_(filters.statuses))
 
+    if filters.after is not None:
+        statement = statement.where(_after_predicate(filters))
+
     return statement
+
+
+def _after_predicate(filters: JobListFilters) -> ColumnElement[bool]:
+    """Return the strict keyset successor for the selected stable ordering."""
+
+    after = filters.after or {}
+    job_id = str(after.get("id") or "")
+    if not job_id:
+        raise ValueError("job cursor is missing its stable id")
+    discovered = after.get("discovered_at")
+    if discovered is not None:
+        discovered = datetime.fromisoformat(str(discovered))
+    deadline = after.get("deadline")
+    if deadline is not None:
+        deadline = date.fromisoformat(str(deadline))
+    score = after.get("score")
+    title = str(after.get("title") or "").casefold()
+    company = str(after.get("company") or "").casefold()
+
+    if filters.sort in {JobSort.SCORE_HIGH, JobSort.SCORE_LOW}:
+        missing = score is None
+        score_order = (
+            Job.latest_score < score
+            if filters.sort is JobSort.SCORE_HIGH
+            else Job.latest_score > score
+        )
+        same_score = (
+            Job.latest_score.is_(None) if missing else Job.latest_score == score
+        )
+        same_position = (Job.discovered_at < discovered) | (
+            (Job.discovered_at == discovered) & (Job.id > job_id)
+        )
+        if missing:
+            return Job.latest_score.is_(None) & same_position
+        return or_(
+            Job.latest_score.is_(None),
+            score_order,
+            (Job.latest_score == score) & same_position,
+        )
+
+    if filters.sort is JobSort.NEWEST:
+        score_missing = Job.latest_score.is_(None)
+        if score is None:
+            same_secondary = score_missing & (Job.id > job_id)
+        else:
+            same_secondary = or_(
+                (Job.latest_score < score),
+                (Job.latest_score == score) & (Job.id > job_id),
+                score_missing,
+            )
+        return or_(
+            Job.discovered_at < discovered,
+            (Job.discovered_at == discovered) & same_secondary,
+        )
+
+    if filters.sort is JobSort.CLOSING_DATE:
+        if deadline is None:
+            if score is None:
+                same_score = Job.latest_score.is_(None) & (Job.id > job_id)
+            else:
+                same_score = or_(
+                    Job.latest_score.is_(None),
+                    (Job.latest_score < score),
+                    (Job.latest_score == score) & (Job.id > job_id),
+                )
+            return Job.deadline.is_(None) & same_score
+        if score is None:
+            same_score = Job.latest_score.is_(None) & (Job.id > job_id)
+        else:
+            same_score = or_(
+                Job.latest_score.is_(None),
+                (Job.latest_score < score),
+                (Job.latest_score == score) & (Job.id > job_id),
+            )
+        same_deadline = or_(
+            Job.deadline.is_(None), (Job.deadline == deadline) & same_score
+        )
+        return or_(Job.deadline > deadline, same_deadline)
+
+    if filters.sort is JobSort.COMPANY:
+        return or_(
+            func.lower(Company.name) > company,
+            (func.lower(Company.name) == company)
+            & or_(
+                func.lower(Job.title) > title,
+                (func.lower(Job.title) == title) & (Job.id > job_id),
+            ),
+        )
+    return or_(
+        func.lower(Job.title) > title,
+        (func.lower(Job.title) == title)
+        & or_(
+            func.lower(Company.name) > company,
+            (func.lower(Company.name) == company) & (Job.id > job_id),
+        ),
+    )
 
 
 def _fts_candidates(

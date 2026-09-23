@@ -1504,6 +1504,16 @@ def build_configured_sources(
                     company=item.name,
                     credential=credential,
                     source_key=f"{provider}:{key}",
+                    page_size=item.page_size,
+                    contract_version=item.contract_version,
+                    max_pages=(
+                        min(
+                            item.max_pages,
+                            math.ceil(config.source_record_cap / item.page_size),
+                        )
+                        if inventory
+                        else item.max_pages
+                    ),
                 )
             )
     # External catalogs are opt-in twice: a configured endpoint and a keyring
@@ -1522,6 +1532,16 @@ def build_configured_sources(
                 company=item.name,
                 credential=credential,
                 source_key=f"freehire:{key}",
+                page_size=item.page_size,
+                contract_version=item.contract_version,
+                max_pages=(
+                    min(
+                        item.max_pages,
+                        math.ceil(config.source_record_cap / item.page_size),
+                    )
+                    if inventory
+                    else item.max_pages
+                ),
             )
         )
     if selected in {"usajobs", "all"}:

@@ -271,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("duplicate", "import", "company_candidate", "suggestion"),
     )
     reviews_approve.add_argument("--canonical-job-id")
+    reviews_approve.add_argument("--expected-hash")
     reviews_dismiss = reviews_sub.add_parser("dismiss")
     reviews_dismiss.add_argument("review_id")
     reviews_dismiss.add_argument(
@@ -279,6 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("duplicate", "import", "company_candidate", "suggestion"),
     )
     reviews_dismiss.add_argument("--reason")
+    reviews_dismiss.add_argument("--expected-hash")
 
     tasks_parser = subparsers.add_parser("tasks", help="Manage follow-up tasks")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
@@ -1018,10 +1020,14 @@ def _headless_command(
                     args.review_id,
                     review_type=args.type,
                     canonical_job_id=args.canonical_job_id,
+                    expected_hash=args.expected_hash,
                 )
             else:
                 payload = facade.dismiss_review(
-                    args.review_id, review_type=args.type, reason=args.reason
+                    args.review_id,
+                    review_type=args.type,
+                    reason=args.reason,
+                    expected_hash=args.expected_hash,
                 )
         elif command == "tasks":
             if args.tasks_command == "list":

@@ -10,17 +10,18 @@ from datetime import datetime
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 
 from .capture import CapturePreview
-from .facade import MAX_PAGE, ApplicationFacade, CaptureInput, SearchInput
+from .facade import ApplicationFacade, CaptureInput, SearchInput
+from .facade_serialization import MAX_RESPONSE_BYTES, enforce_response_budget
 
 
 class MCPRecord(BaseModel):
     """Bounded, documented extension record for evidence-bearing inputs."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     source: str | None = Field(default=None, max_length=200)
     source_id: str | None = Field(default=None, max_length=500)
@@ -48,7 +49,7 @@ class MCPFollowUpTask(BaseModel):
 
 
 class MCPCompanyCandidate(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=300)
     website: str | None = Field(default=None, max_length=2_000)
@@ -56,12 +57,12 @@ class MCPCompanyCandidate(BaseModel):
     role: str | None = Field(default=None, max_length=300)
     location: str | None = Field(default=None, max_length=300)
     industry: str | None = Field(default=None, max_length=300)
-    evidence: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    evidence: list[MCPRecord] = Field(default_factory=list, max_length=50)
     score: float | None = Field(default=None, ge=0, le=1)
 
 
 class MCPWatchCriteria(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     role: str | None = Field(default=None, max_length=300)
     location: str | None = Field(default=None, max_length=300)
@@ -77,7 +78,123 @@ class MCPOfferInput(BaseModel):
     currency: str = Field(default="USD", min_length=3, max_length=3)
     cost_of_living_index: float = Field(default=100, ge=0)
     stress_score: float = Field(default=3, ge=0, le=5)
-    terms: dict[str, Any] = Field(default_factory=dict)
+    terms: dict[str, str | int | float | bool | None] = Field(
+        default_factory=dict, max_length=50
+    )
+
+
+class MCPApplicationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=100)
+    submission_channel: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=20_000)
+
+
+class MCPApplicationTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str = Field(min_length=1, max_length=100)
+    to_stage: str = Field(min_length=1, max_length=80)
+    reason: str | None = Field(default=None, max_length=20_000)
+    expected_stage: str | None = Field(default=None, max_length=80)
+
+
+class MCPTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=500)
+    description: str | None = Field(default=None, max_length=20_000)
+    due_at: datetime | None = None
+    job_id: str | None = Field(default=None, max_length=100)
+    application_id: str | None = Field(default=None, max_length=100)
+
+
+class MCPContactCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=300)
+    company_id: str | None = Field(default=None, max_length=100)
+    email: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, max_length=300)
+    linkedin_url: str | None = Field(default=None, max_length=2_000)
+    notes: str | None = Field(default=None, max_length=20_000)
+
+
+class MCPInterviewCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str = Field(min_length=1, max_length=100)
+    starts_at: datetime
+    ends_at: datetime | None = None
+    interview_type: str | None = Field(default=None, max_length=200)
+    location_or_link: str | None = Field(default=None, max_length=2_000)
+    contact_id: str | None = Field(default=None, max_length=100)
+    notes: str | None = Field(default=None, max_length=20_000)
+
+
+class MCPInterviewQuestionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1, max_length=5_000)
+    role_focus: str | None = Field(default=None, max_length=300)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    skills: list[str] = Field(default_factory=list, max_length=50)
+    evidence_keys: list[str] = Field(default_factory=list, max_length=50)
+
+
+class MCPInterviewSessionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str = Field(min_length=1, max_length=100)
+    session_type: str = Field(default="preparation", max_length=100)
+    interview_id: str | None = Field(default=None, max_length=100)
+    role_focus: str | None = Field(default=None, max_length=300)
+    notes: str | None = Field(default=None, max_length=20_000)
+    answers: list[MCPInterviewAnswer] = Field(default_factory=list, max_length=100)
+
+
+class MCPOfferCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    application_id: str = Field(min_length=1, max_length=100)
+    offer: MCPOfferInput
+
+
+class MCPOfferDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    offer_id: str = Field(min_length=1, max_length=100)
+    decision: str | None = Field(default=None, max_length=100)
+
+
+class MCPCompanyWatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    company_id: str = Field(min_length=1, max_length=100)
+    criteria: MCPWatchCriteria | None = None
+    cadence_days: int = Field(default=7, ge=1, le=365)
+
+
+class MCPCompanyUnwatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    company_id: str = Field(min_length=1, max_length=100)
+
+
+MCPMutationPayload = (
+    MCPApplicationCreate
+    | MCPApplicationTransition
+    | MCPTaskCreate
+    | MCPContactCreate
+    | MCPInterviewCreate
+    | MCPInterviewQuestionCreate
+    | MCPInterviewSessionCreate
+    | MCPOfferCreate
+    | MCPOfferDecision
+    | MCPCompanyWatch
+    | MCPCompanyUnwatch
+)
 
 
 class MCPMutationInput(BaseModel):
@@ -96,8 +213,29 @@ class MCPMutationInput(BaseModel):
         "company.watch",
         "company.unwatch",
     ]
-    payload: dict[str, Any]
+    payload: MCPMutationPayload
     ttl_seconds: int = Field(default=600, ge=30, le=3_600)
+
+    @model_validator(mode="after")
+    def payload_matches_action(self) -> "MCPMutationInput":
+        expected = {
+            "application.create": MCPApplicationCreate,
+            "application.transition": MCPApplicationTransition,
+            "task.create": MCPTaskCreate,
+            "contact.create": MCPContactCreate,
+            "interview.create": MCPInterviewCreate,
+            "interview_question.create": MCPInterviewQuestionCreate,
+            "interview_session.create": MCPInterviewSessionCreate,
+            "offer.create": MCPOfferCreate,
+            "offer.decision": MCPOfferDecision,
+            "company.watch": MCPCompanyWatch,
+            "company.unwatch": MCPCompanyUnwatch,
+        }[self.action]
+        if not isinstance(self.payload, expected):
+            raise ValueError(
+                f"payload type {type(self.payload).__name__} does not match {self.action}"
+            )
+        return self
 
 
 def create_server(facade: ApplicationFacade | None = None):
@@ -146,9 +284,14 @@ def create_server(facade: ApplicationFacade | None = None):
 
     @server.tool()
     def list_pipeline(
-        stage: str | None = None, limit: int = 50, offset: int = 0
+        stage: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        return facade.list_pipeline(stage=stage, limit=limit, offset=offset)
+        return facade.list_pipeline(
+            stage=stage, limit=limit, offset=offset, cursor=cursor
+        )
 
     @server.tool()
     def get_application(application_id: str) -> dict[str, Any]:
@@ -162,25 +305,39 @@ def create_server(facade: ApplicationFacade | None = None):
 
     @server.tool()
     def list_tasks(
-        status: str | None = None, limit: int = 50, offset: int = 0
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
-        return facade.list_tasks(status=status, limit=limit, offset=offset)
+        return facade.list_tasks(
+            status=status, limit=limit, offset=offset, cursor=cursor
+        )
 
     @server.tool()
     def list_alerts(limit: int = 50, unread_only: bool = True) -> list[dict[str, Any]]:
         return facade.list_alerts(limit=limit, unread_only=unread_only)
 
     @server.tool()
-    def list_pending_reviews(limit: int = 50) -> list[dict[str, Any]]:
-        return facade.list_pending_reviews(limit=limit)
+    def list_pending_reviews(
+        limit: int = 50, cursor: str | None = None
+    ) -> dict[str, Any]:
+        return facade.list_pending_reviews_page(limit=limit, cursor=cursor)
 
     @server.tool()
     def list_documents(
-        status: str | None = None, limit: int = 50, full_content: bool = False
-    ) -> list[dict[str, Any]]:
-        return facade.list_documents(
-            status=status, limit=limit, full_content=full_content
+        status: str | None = None,
+        limit: int = 50,
+        full_content: bool = False,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return facade.list_documents_page(
+            status=status, limit=limit, full_content=full_content, cursor=cursor
         )
+
+    @server.tool()
+    def get_document(document_id: str, full_content: bool = False) -> dict[str, Any]:
+        return facade.get_document(document_id, full_content=full_content)
 
     @server.tool()
     def get_analytics() -> dict[str, Any]:
@@ -259,7 +416,9 @@ def create_server(facade: ApplicationFacade | None = None):
     @server.tool()
     def prepare_mutation(request: MCPMutationInput) -> dict[str, Any]:
         return facade.prepare_mutation(
-            request.action, request.payload, ttl_seconds=request.ttl_seconds
+            request.action,
+            request.payload.model_dump(exclude_none=True, mode="json"),
+            ttl_seconds=request.ttl_seconds,
         )
 
     @server.tool()
@@ -381,16 +540,28 @@ def create_server(facade: ApplicationFacade | None = None):
         review_id: str,
         review_type: str = "duplicate",
         canonical_job_id: str | None = None,
+        expected_hash: str | None = None,
     ) -> dict[str, Any]:
         return facade.approve_review(
-            review_id, review_type=review_type, canonical_job_id=canonical_job_id
+            review_id,
+            review_type=review_type,
+            canonical_job_id=canonical_job_id,
+            expected_hash=expected_hash,
         )
 
     @server.tool()
     def dismiss_review(
-        review_id: str, review_type: str = "duplicate", reason: str | None = None
+        review_id: str,
+        review_type: str = "duplicate",
+        reason: str | None = None,
+        expected_hash: str | None = None,
     ) -> dict[str, Any]:
-        return facade.dismiss_review(review_id, review_type=review_type, reason=reason)
+        return facade.dismiss_review(
+            review_id,
+            review_type=review_type,
+            reason=reason,
+            expected_hash=expected_hash,
+        )
 
     @server.tool()
     def create_interview_question(
@@ -503,16 +674,19 @@ def create_server(facade: ApplicationFacade | None = None):
                 .limit(200)
             )
             return json.dumps(
-                {
-                    "approved_facts": [
-                        {
-                            "fact_key": row.fact_key,
-                            "value": row.value_json,
-                            "content_hash": row.content_hash,
-                        }
-                        for row in facts
-                    ]
-                },
+                enforce_response_budget(
+                    {
+                        "approved_facts": [
+                            {
+                                "fact_key": row.fact_key,
+                                "value": row.value_json,
+                                "content_hash": row.content_hash,
+                            }
+                            for row in facts
+                        ]
+                    },
+                    budget=MAX_RESPONSE_BYTES,
+                ),
                 default=str,
             )
 
@@ -528,26 +702,37 @@ def create_server(facade: ApplicationFacade | None = None):
 
     @server.resource("jobby://jobs/{job_id}")
     def job_resource(job_id: str) -> str:
-        return json.dumps(facade.get_job(job_id), default=str)
+        return json.dumps(
+            enforce_response_budget(facade.get_job(job_id), budget=MAX_RESPONSE_BYTES),
+            default=str,
+        )
 
     @server.resource("jobby://applications/{application_id}")
     def application_resource(application_id: str) -> str:
-        return json.dumps(facade.get_application(application_id), default=str)
+        return json.dumps(
+            enforce_response_budget(
+                facade.get_application(application_id), budget=MAX_RESPONSE_BYTES
+            ),
+            default=str,
+        )
 
     @server.resource("jobby://documents/{document_id}")
     def document_resource(document_id: str) -> str:
-        docs = [
-            item
-            for item in facade.list_documents(limit=MAX_PAGE)
-            if item.get("id") == document_id
-        ]
-        if not docs:
-            raise ValueError("document not found")
-        return json.dumps(docs[0], default=str)
+        return json.dumps(
+            enforce_response_budget(
+                facade.get_document(document_id), budget=MAX_RESPONSE_BYTES
+            ),
+            default=str,
+        )
 
     @server.resource("jobby://pending-reviews")
     def pending_reviews_resource() -> str:
-        return json.dumps(facade.list_pending_reviews(), default=str)
+        return json.dumps(
+            enforce_response_budget(
+                facade.list_pending_reviews(), budget=MAX_RESPONSE_BYTES
+            ),
+            default=str,
+        )
 
     return server
 
