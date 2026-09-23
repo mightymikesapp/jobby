@@ -28,7 +28,12 @@ from urllib.parse import (
 
 import httpx
 
-from jobby.normalization import is_public_http_url, normalize_remote, normalize_salary
+from jobby.normalization import (
+    NormalizedSalary,
+    is_public_http_url,
+    normalize_remote,
+    normalize_salary,
+)
 from jobby.sources.base import (
     ScanItem,
     SourceError,
@@ -600,6 +605,36 @@ class LeverSource(StructuredJobSource):
         )
 
 
+def _ashby_structured_salary(
+    compensation: Mapping[str, Any],
+) -> NormalizedSalary | None:
+    """Read the salary component Ashby publishes beside its summary string.
+
+    The summary ("$176K – $280K") carries no period; the component carries the
+    bounds, currency, and interval ("1 YEAR"), so it is preferred when present.
+    """
+
+    components = compensation.get("summaryComponents")
+    if not isinstance(components, list):
+        return None
+    for component in components:
+        if not isinstance(component, Mapping):
+            continue
+        if component.get("compensationType") != "Salary":
+            continue
+        salary = normalize_salary(
+            {
+                "min": component.get("minValue"),
+                "max": component.get("maxValue"),
+                "currency": component.get("currencyCode"),
+                "interval": component.get("interval"),
+            }
+        )
+        if salary is not None:
+            return salary
+    return None
+
+
 class AshbySource(StructuredJobSource):
     name = "ashby"
 
@@ -647,6 +682,9 @@ class AshbySource(StructuredJobSource):
             or record.get("salary")
         )
         salary_text = _salary_text(salary_value)
+        salary = _ashby_structured_salary(compensation)
+        if salary is None and salary_value:
+            salary = normalize_salary(salary_value)
         return ScanItem(
             source=self.source_key,
             source_id=str(_required(record, "id")),
@@ -661,7 +699,7 @@ class AshbySource(StructuredJobSource):
                 or ""
             ),
             salary_text=salary_text,
-            salary=normalize_salary(salary_value) if salary_value else None,
+            salary=salary,
             remote=normalize_remote(record.get("isRemote"), location=location),
             posted_at=_datetime(
                 record.get("publishedAt") or record.get("published_at")

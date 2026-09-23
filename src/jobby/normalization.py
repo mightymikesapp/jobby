@@ -862,6 +862,22 @@ def _passage_salary_candidates(
     return candidates
 
 
+def _decoded_text(value: object) -> str:
+    """Return tag-free text, decoding HTML that arrives escaped more than once.
+
+    Greenhouse serves ``content`` as escaped HTML (``&lt;span&gt;$166,000``), so a
+    single unescape leaves literal tags between the two ends of a pay range.
+    """
+
+    text = str(value or "")[:500_000]
+    for _ in range(3):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    return html.unescape(_HTML_TAG_RE.sub(" ", text)).replace("\x00", "�")
+
+
 def extract_compensation(value: object) -> CompensationExtraction:
     """Extract a deterministic range and exact quoted passage from a posting.
 
@@ -869,8 +885,7 @@ def extract_compensation(value: object) -> CompensationExtraction:
     isolated years, headcounts, and experience requirements are ignored.
     """
 
-    text = html.unescape(_HTML_TAG_RE.sub(" ", str(value or "")))
-    text = text.replace("\x00", "�")[:500_000]
+    text = _decoded_text(value)
     candidates: list[tuple[float, int, NormalizedSalary, str]] = []
     for passage in re.split(r"(?<=[.!?])\s+|[\r\n]+", text):
         passage = _SPACE_RE.sub(" ", passage).strip()

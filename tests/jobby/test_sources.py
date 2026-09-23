@@ -183,6 +183,48 @@ def test_ashby_maps_remote_posting() -> None:
     assert item.salary.maximum == Decimal("110000")
 
 
+def test_ashby_reads_the_salary_period_from_the_structured_component() -> None:
+    # Ashby's summary string carries no period; the Salary component does.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "jobs": [
+                    {
+                        "id": "ash-2",
+                        "title": "Legal Engineer",
+                        "jobUrl": "https://jobs.ashbyhq.com/example/ash-2",
+                        "location": "New York",
+                        "descriptionPlain": "Run pilots.",
+                        "compensation": {
+                            "scrapeableCompensationSalarySummary": "$176K - $280K",
+                            "summaryComponents": [
+                                {"compensationType": "Bonus", "interval": "1 YEAR"},
+                                {
+                                    "compensationType": "Salary",
+                                    "interval": "1 YEAR",
+                                    "currencyCode": "USD",
+                                    "minValue": 176000,
+                                    "maxValue": 280000,
+                                },
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+
+    with mock_client(handler) as client:
+        item = AshbySource(client, board="example").scan().items[0]
+
+    assert item.salary is not None
+    assert item.salary.minimum == Decimal("176000")
+    assert item.salary.maximum == Decimal("280000")
+    assert item.salary.period is SalaryPeriod.YEAR
+    assert item.salary_text == "$176K - $280K"
+
+
 def test_workable_builds_public_job_url() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/widget/accounts/example/vacancies"

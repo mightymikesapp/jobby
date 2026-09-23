@@ -132,3 +132,17 @@ def test_a_rescan_clears_pay_an_earlier_extraction_misread(tmp_path) -> None:
             assert job.compensation_period == "unknown"
     finally:
         database.dispose()
+
+
+def test_pay_range_in_double_escaped_html_is_read_whole() -> None:
+    # Greenhouse serves content as escaped HTML; the range spans several tags.
+    content = (
+        "&lt;div class=&quot;title&quot;&gt;Local Pay Range&lt;/div&gt;"
+        "&lt;div class=&quot;pay-range&quot;&gt;&lt;span&gt;$166,000&lt;/span&gt;"
+        "&lt;span class=&quot;divider&quot;&gt;&amp;mdash;&lt;/span&gt;"
+        "&lt;span&gt;$225,000 USD&lt;/span&gt;&lt;/div&gt;"
+    )
+    salary = extract_compensation(content).salary
+    assert salary is not None
+    assert (salary.minimum, salary.maximum) == (Decimal("166000"), Decimal("225000"))
+    assert salary.period is SalaryPeriod.YEAR
