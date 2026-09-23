@@ -37,6 +37,13 @@ from jobby.sources.base import ScanItem, ScanStatus, SourceResult
             SalaryPeriod.HOUR,
         ),
         ("Pay: $25 per hour.", 25, None, SalaryPeriod.HOUR),
+        # The pay word sat on the previous line; an hourly rate is still pay.
+        (
+            "US based candidates: $50/hour - $100/hour depending on experience.",
+            50,
+            None,
+            SalaryPeriod.HOUR,
+        ),
         (
             "The annual base salary range is $120,000 - $150,000.",
             120_000,

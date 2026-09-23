@@ -806,14 +806,16 @@ def _passage_salary_candidates(
         # explicit base-pay phrase, or pay period remains useful evidence.
         if contains_non_base and not (nearby_base_pay or contains_base_pay):
             continue
-        # A lone amount must follow a pay word; "$10M+ annually" in a line
-        # about media budgets is money, not compensation.
-        if not has_range and not pay_context:
+        local_period = _local_period(passage, match.start(), match.end())
+        # A lone amount must follow a pay word, unless it is an hourly rate
+        # ("$50/hour"); "$10M+ annually" in a line about media budgets is
+        # money, not compensation.
+        hourly = local_period == SalaryPeriod.HOUR
+        if not has_range and not pay_context and not hourly:
             continue
         surrounding = passage[max(0, match.start() - 60) : match.end() + 40]
         if _NON_PAY_AMOUNT_RE.search(surrounding) and not pay_context:
             continue
-        local_period = _local_period(passage, match.start(), match.end())
         salary = normalize_salary(match.group(0), period=local_period)
         if salary is None:
             continue
