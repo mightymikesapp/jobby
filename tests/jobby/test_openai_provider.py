@@ -353,7 +353,13 @@ def test_provider_errors_are_bounded_redacted_and_usage_is_sanitized(
 ) -> None:
     client = MagicMock()
     client.responses.parse.side_effect = RuntimeError(
-        "Authorization: Bearer sk-secretvalue123 api_key=sk-anothersecret456 "
+        # Assembled at runtime so the source never contains a key-shaped literal.
+        "Authorization: Bearer "
+        + "sk-"
+        + "secretvalue123"
+        + " api_key="
+        + "sk-"
+        + "anothersecret456 "
         + "x" * 5_000
     )
     provider = OpenAIProvider(config(), client=client)
