@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Job Board Monitor — Mike Sapp 2026
+Job Board Monitor — legacy compatibility helper
 Monitors Greenhouse, Lever, Ashby, and USAJobs for new relevant postings.
 
 Setup:
@@ -170,7 +170,7 @@ MANUAL_WATCHLIST_FALLBACK = [
     ("FTC",                         "https://www.ftc.gov/about-ftc/careers",              "law clerk, honors attorney, policy analyst, tech"),
     ("U.S. Copyright Office",       "https://www.loc.gov/careers/",                       "policy analyst, attorney advisor, AI copyright, Ringer Fellowship, Kaminstein Program"),
     ("NTIA",                        "https://www.ntia.gov/page/careers-ntia",             "policy analyst, tech policy, AI, spectrum"),
-    # ── Legal Tech (no bar, J.D. + mikecheck.ai is the pitch)
+# ── Legal Tech and technology-policy roles
     # ── Dream employers / AI & semiconductor — high-match post-bar targets
     # NVIDIA → moved to WORKDAY_COMPANIES (automated)
     # Intel  → moved to WORKDAY_COMPANIES (automated)
@@ -289,7 +289,7 @@ def priority_score(matched: list[str]) -> int:
 
 # ── USAJobs ───────────────────────────────────────────────────────────────────
 
-USAJOBS_EMAIL   = "mike@mikecheck.ai"
+USAJOBS_EMAIL   = os.environ.get("USAJOBS_EMAIL", "jobby@example.invalid")
 USAJOBS_API_KEY = os.environ.get("USAJOBS_API_KEY", "")
 USAJOBS_SEARCHES = [
     "attorney advisor",            # GS-0905 series — standard federal attorney entry point
@@ -644,7 +644,7 @@ EXCLUDE_PATTERNS = [
     # "Attorney Advisor" and policy-adjacent "Policy Advisor" roles visible.
     re.compile(r'^advisor\b',        re.IGNORECASE),
     re.compile(r'\bchief\b.*\bofficer\b', re.IGNORECASE),  # C-suite only — NOT entry "Compliance/Privacy/T&S Officer"
-    # NOTE: bare "intern"/"internship" removed — Mike pursues PAID JD-intern roles
+    # NOTE: bare "intern"/"internship" removed — retain focused paid roles
     # (e.g. Hulu Business Affairs & Legal JD Intern). Unpaid ones are filtered at evaluation.
     re.compile(r'\bstaff\b',          re.IGNORECASE),  # "Staff Engineer", "Staff PM" = senior IC
     re.compile(r'\b(?:TPM|Program Manager)\s*III\b', re.IGNORECASE),  # level III+ = senior

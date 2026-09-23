@@ -538,7 +538,7 @@ def test_import_omits_credential_shaped_profile_facts_and_private_portal_urls(tm
     profile.parent.mkdir(parents=True)
     profile.write_text(
         "identity:\n"
-        "  name: Mike\n"
+        "  name: Fixture\n"
         "  work_authorization: true\n"
         "  openai_api_key: sk-profile-secret-123456789\n",
         encoding="utf-8",
@@ -557,7 +557,7 @@ def test_import_omits_credential_shaped_profile_facts_and_private_portal_urls(tm
         configs = list(session.scalars(select(SourceConfig)))
         reviews = list(session.scalars(select(ImportReview)))
     assert {(fact.fact_key, fact.value_json) for fact in facts} == {
-        ("identity.name", "Mike"),
+        ("identity.name", "Fixture"),
         ("identity.work_authorization", True),
     }
     assert configs == []

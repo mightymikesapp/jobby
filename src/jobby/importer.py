@@ -1537,7 +1537,10 @@ class LegacyImporter:
             relative
             for relative in self._artifact_by_relative
             if "/" not in relative
-            and "job search tracker" in Path(relative).name.casefold()
+            and (
+                "job search tracker" in Path(relative).name.casefold()
+                or "application tracker" in Path(relative).name.casefold()
+            )
             and Path(relative).suffix.casefold() == ".md"
         )
         for relative in tracker_paths:
@@ -2415,6 +2418,11 @@ def document_source_sort_key(relative: str) -> tuple[str, int, str]:
 
 def is_canonical_master_resume(path: Path, kind: ArtifactKind) -> bool:
     return kind == ArtifactKind.RESUME and path.name.casefold() in {
+        "fixture candidate resume 2026.md",
+        "fixture candidate resume 2026.docx",
+        "fixture candidate resume 2026.pdf",
+        # Preserve recognition for legacy local workspaces without publishing
+        # those names in public fixtures.
         "mike sapp resume 2026.md",
         "mike sapp resume 2026.docx",
         "mike sapp resume 2026.pdf",

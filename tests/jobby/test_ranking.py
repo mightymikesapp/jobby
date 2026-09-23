@@ -679,7 +679,7 @@ def test_locked_manual_result_is_preserved_until_explicit_unlock():
         {"title": "Manual role", "description": "Legal AI role", "location": "Remote"},
         manual_override={
             "score": 4.8,
-            "explanation": "Reviewed by Mike",
+            "explanation": "Reviewed by Fixture",
             "locked": True,
         },
     )
@@ -693,7 +693,7 @@ def test_locked_manual_result_is_preserved_until_explicit_unlock():
     assert preserved.score == 4.8
     assert preserved.rescored is False
     assert preserved.preserved_manual_override is True
-    assert preserved.explanation == "Reviewed by Mike"
+    assert preserved.explanation == "Reviewed by Fixture"
 
     unlocked = evaluate_job(
         changed_job,

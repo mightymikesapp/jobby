@@ -237,7 +237,7 @@ def test_icims_and_taleo_parse_static_html_and_accept_empty_boards() -> None:
 
 def _base_resume() -> tuple[DocumentVersion, str]:
     content = (
-        "# Mike Sapp\n\n## Summary\nPolicy professional.\n\n"
+        "# Fixture Candidate\n\n## Summary\nPolicy professional.\n\n"
         "## Experience\n\n### Acme — Counsel | 2024–2026\n"
         "- Drafted policy guidance.\n\n## Education\nJD, 2026"
     )

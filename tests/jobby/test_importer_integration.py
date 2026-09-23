@@ -137,7 +137,7 @@ def _scan_report(title: str = "Policy Analyst", *, include_url: bool = True) -> 
 
 
 def _tracker(entries: list[tuple[str, str, str]]) -> str:
-    blocks = ["# Job Search Tracker"]
+    blocks = ["# Application Tracker"]
     for index, (company, title, status_text) in enumerate(entries, 1):
         blocks.append(
             f"""
@@ -203,13 +203,14 @@ def test_repeat_import_is_stable_and_never_rewrites_workspace_sources(tmp_path):
     _write(workspace / "data/pipeline.md", _pipeline_line())
     _write(workspace / "new_jobs_2026-03-01.md", _scan_report())
     _write(
-        workspace / "Job Search Tracker - Test.md",
+        workspace / "Application Tracker - Test.md",
         _tracker(
             [("Tracked Co", "Applied Researcher", "✅ **SUBMITTED — March 3, 2026**")]
         ),
     )
     _write(
-        workspace / "Mike Sapp Resume 2026.md", "# Mike Sapp\n\nOriginal resume text.\n"
+        workspace / "Fixture Candidate Resume 2026.md",
+        "# Fixture Candidate\n\nOriginal resume text.\n",
     )
     _write(workspace / "job_monitor_state.json", '{"seen_jobs": ["gh:1", "gh:2"]}')
     source_state = {
@@ -277,12 +278,15 @@ def test_changed_source_and_resume_create_immutable_artifact_and_document_versio
 ):
     database, importer, workspace = _importer(tmp_path)
     resume = _write(
-        workspace / "Mike Sapp Resume 2026.md", "# Mike Sapp\n\nVersion one.\n"
+        workspace / "Fixture Candidate Resume 2026.md",
+        "# Fixture Candidate\n\nVersion one.\n",
     )
     first_source_hash = sha256_file(resume)
     importer.run(workspace)
 
-    resume.write_text("# Mike Sapp\n\nVersion two with a new fact.\n", encoding="utf-8")
+    resume.write_text(
+        "# Fixture Candidate\n\nVersion two with a new fact.\n", encoding="utf-8"
+    )
     second_source_hash = sha256_file(resume)
     importer.run(workspace)
 
@@ -303,8 +307,8 @@ def test_changed_source_and_resume_create_immutable_artifact_and_document_versio
     ]
     assert [document.version for document in documents] == [1, 2]
     assert [document.content_markdown for document in documents] == [
-        "# Mike Sapp\n\nVersion one.\n",
-        "# Mike Sapp\n\nVersion two with a new fact.\n",
+        "# Fixture Candidate\n\nVersion one.\n",
+        "# Fixture Candidate\n\nVersion two with a new fact.\n",
     ]
     assert all(artifact.source_immutable for artifact in artifacts)
     assert all(Path(artifact.stored_path).read_bytes() for artifact in artifacts)
@@ -324,30 +328,33 @@ def test_resume_formats_collapse_into_three_semantic_variants_with_one_canonical
 
     database, importer, workspace = _importer(tmp_path)
     master_text = (
-        "Mike Sapp legal technology policy governance patent portfolio "
+        "Fixture Candidate legal technology policy governance patent portfolio "
         "New Media Rights Clinic artificial intelligence research"
     )
-    _write(workspace / "Mike Sapp Resume 2026.md", f"# Mike Sapp\n\n{master_text}\n")
+    _write(
+        workspace / "Fixture Candidate Resume 2026.md",
+        f"# Fixture Candidate\n\n{master_text}\n",
+    )
     master_docx = Document()
-    master_docx.add_heading("Mike Sapp", level=1)
+    master_docx.add_heading("Fixture Candidate", level=1)
     master_docx.add_paragraph(master_text)
-    master_docx.save(workspace / "Mike Sapp Resume 2026.docx")
+    master_docx.save(workspace / "Fixture Candidate Resume 2026.docx")
 
     _write(
-        workspace / "Mike_Sapp_Anthropic_Tailored_Resume.md",
-        "# Mike Sapp\n\nAnthropic safeguards enforcement and AI evaluation systems.\n",
+        workspace / "Fixture_Candidate_Anthropic_Tailored_Resume.md",
+        "# Fixture Candidate\n\nAnthropic safeguards enforcement and AI evaluation systems.\n",
     )
     legora_text = (
-        "Mike Sapp legal data analyst structured datasets prompt engineering "
+        "Fixture Candidate legal data analyst structured datasets prompt engineering "
         "quality assurance legal workflows"
     )
     _write(
         workspace / "output/legora-legal-data-analyst-resume.md",
-        f"# Mike Sapp\n\n{legora_text}\n",
+        f"# Fixture Candidate\n\n{legora_text}\n",
     )
     _write(
         workspace / "output/legora-legal-data-analyst-resume.html",
-        f"<html><body><h1>Mike Sapp</h1><p>{legora_text}</p></body></html>",
+        f"<html><body><h1>Fixture Candidate</h1><p>{legora_text}</p></body></html>",
     )
 
     importer.run(workspace)
@@ -372,7 +379,7 @@ def test_resume_formats_collapse_into_three_semantic_variants_with_one_canonical
             .where(Artifact.document_version_id == canonical[0].id)
         )
     assert linked_sources == 2
-    assert canonical[0].content_markdown.startswith("# Mike Sapp")
+    assert canonical[0].content_markdown.startswith("# Fixture Candidate")
     assert (
         sum(document.approval_state.value == "approved" for document in documents) == 1
     )
@@ -585,7 +592,7 @@ def test_repeated_scan_reports_keep_each_observation_and_title_snapshot_without_
 def test_tracker_ten_point_metrics_never_become_rank_evaluations(tmp_path):
     database, importer, workspace = _importer(tmp_path)
     _write(
-        workspace / "Job Search Tracker - Test.md",
+        workspace / "Application Tracker - Test.md",
         _tracker([("Metrics Co", "Counsel", "**Active — applications open**")]),
     )
     importer.run(workspace)
@@ -634,7 +641,7 @@ def test_explicit_tracker_statuses_create_ordered_events_and_advance_on_reimport
     tmp_path,
 ):
     database, importer, workspace = _importer(tmp_path)
-    tracker = workspace / "Job Search Tracker - Test.md"
+    tracker = workspace / "Application Tracker - Test.md"
     _write(
         tracker,
         _tracker(

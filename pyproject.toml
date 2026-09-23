@@ -9,7 +9,7 @@ description = "Local-first, headless personal job-search operating system"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = "LicenseRef-Proprietary"
-authors = [{ name = "Mike Sapp" }]
+authors = [{ name = "Jobby contributors" }]
 keywords = ["jobs", "local-first", "sqlite", "cli", "mcp"]
 classifiers = [
   "Development Status :: 3 - Alpha",

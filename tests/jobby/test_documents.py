@@ -49,7 +49,7 @@ def make_database(tmp_path: Path) -> Database:
 def add_source_document(
     database: Database,
     *,
-    content: str = "# Mike Sapp\n\n## Experience\n\n- Drafted policy guidance",
+    content: str = "# Fixture Candidate\n\n## Experience\n\n- Drafted policy guidance",
     kind: ArtifactKind = ArtifactKind.RESUME,
 ) -> str:
     with database.session() as session:
@@ -123,7 +123,9 @@ def test_proposal_requires_review_and_approval_updates_canonical_and_diff(
     database = make_database(tmp_path)
     source_id = add_source_document(database)
     service = DocumentService(database)
-    proposed_content = "# Mike Sapp\n\n## Experience\n\n- Drafted AI policy guidance"
+    proposed_content = (
+        "# Fixture Candidate\n\n## Experience\n\n- Drafted AI policy guidance"
+    )
 
     proposal = service.propose(
         base_version_id=source_id,
@@ -287,7 +289,7 @@ def test_ai_proposal_uses_only_approved_facts_and_records_base_provenance(
 
     provider = StubAIProvider(
         DraftDocumentResponse(
-            content_markdown="# Mike Sapp\n\n## Experience\n\n- Drafted policy guidance",
+            content_markdown="# Fixture Candidate\n\n## Experience\n\n- Drafted policy guidance",
             facts_used=["experience.policy", "experience.policy"],
             keywords_addressed=["governance"],
         )
@@ -307,7 +309,7 @@ def test_ai_proposal_uses_only_approved_facts_and_records_base_provenance(
         "relationship": "base_document",
         "document_version_id": source_id,
         "content_hash": digest(
-            "# Mike Sapp\n\n## Experience\n\n- Drafted policy guidance"
+            "# Fixture Candidate\n\n## Experience\n\n- Drafted policy guidance"
         ),
     }
     assert proposal.provenance[1] == {
@@ -400,7 +402,7 @@ def test_approved_document_renders_md_html_docx_and_mocked_pdf(tmp_path: Path) -
     database = make_database(tmp_path)
     source_id = add_source_document(database)
     service = DocumentService(database)
-    content = "# Mike & Sapp\n\n## Experience\n\n- **AI policy** & governance"
+    content = "# Fixture & Candidate\n\n## Experience\n\n- **AI policy** & governance"
     proposal = service.propose(
         base_version_id=source_id,
         content_markdown=content,
@@ -419,7 +421,7 @@ def test_approved_document_renders_md_html_docx_and_mocked_pdf(tmp_path: Path) -
     assert set(outputs) == {"markdown", "html", "docx", "pdf"}
     assert outputs["markdown"].read_text(encoding="utf-8") == content
     rendered_html = outputs["html"].read_text(encoding="utf-8")
-    assert "<h1>Mike &amp; Sapp</h1>" in rendered_html
+    assert "<h1>Fixture &amp; Candidate</h1>" in rendered_html
     assert "<strong>AI policy</strong> &amp; governance" in rendered_html
     assert "<script" not in document_html("<script>alert(1)</script>")
     word_text = "\n".join(

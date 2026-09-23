@@ -318,7 +318,11 @@ the unsafe path-only import mode has been removed.
 
 ## Legacy workspace
 
-This directory is a personal legal job-search workspace. It combines a job-board scanner, role evaluation reports, application materials, and small utilities for PDF generation, liveness checks, and pipeline maintenance.
+This repository contains a local-first job-search workspace. It combines a
+job-board scanner, role evaluation reports, application materials, and small
+utilities for PDF generation, liveness checks, and pipeline maintenance. Local
+source material and generated work product are intentionally excluded from the
+public source tree.
 
 ## Main Files
 

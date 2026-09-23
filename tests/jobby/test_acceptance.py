@@ -53,7 +53,7 @@ from jobby.pipeline import (
 from jobby.ranking import RankingProfile, evaluate_and_persist
 
 
-SECRET_CANARY = "sk-jobby-acceptance-secret-never-persist"
+SECRET_CANARY = "fixture-acceptance-secret-never-persist"
 
 
 def _paths(tmp_path: Path) -> JobbyPaths:
@@ -87,13 +87,13 @@ def _write_workspace(workspace: Path) -> dict[str, tuple[str, int]]:
             "This is a full-time remote role paying $150,000 to $180,000. "
             "No billable-hour requirement, quota, travel, or on-call rotation.\n"
         ),
-        "Mike Sapp Resume 2026.md": (
-            "# Mike Sapp\n\n"
+        "Fixture Candidate Resume 2026.md": (
+            "# Fixture Candidate\n\n"
             "## Experience\n\n"
             "- Drafted responsible AI policy guidance.\n"
         ),
         "Cover Letter - Example Co.md": (
-            "# Mike Sapp\n\nI am interested in responsible technology policy work.\n"
+            "# Fixture Candidate\n\nI am interested in responsible technology policy work.\n"
         ),
     }
     for relative, content in files.items():
@@ -233,11 +233,11 @@ def test_offline_end_to_end_flow_preserves_approval_boundaries_and_secrets(
     approved_document_ids: list[str] = []
     tailored_content = {
         ArtifactKind.RESUME: (
-            "# Mike Sapp\n\n## Experience\n\n"
+            "# Fixture Candidate\n\n## Experience\n\n"
             "- Drafted responsible AI policy guidance for cross-functional governance projects.\n"
         ),
         ArtifactKind.COVER_LETTER: (
-            "# Mike Sapp\n\n"
+            "# Fixture Candidate\n\n"
             "I am interested in the AI Policy Counsel role and its responsible AI governance work.\n"
         ),
     }

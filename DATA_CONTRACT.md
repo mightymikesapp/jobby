@@ -2,18 +2,13 @@
 
 Defines which files are user data (never auto-updated) vs system data (safe to update with new versions).
 
-## User Layer (PROTECTED — never auto-modify)
+## User Layer (PROTECTED — local-only, never auto-modify)
 
 These files contain personal data, customizations, and work product. No automated process may read, modify, or delete them without explicit user approval.
 
 | File | Purpose |
 |------|---------|
-| `Mike Sapp Resume 2026.md` | Master resume — source of truth |
-| `Mike_Sapp_AI_Policy_Portfolio.md` | Policy positioning document |
-| `Patent Portfolio Licensing Model — mikecheck.md` | Patent strategy |
-| `Cover Letter - *.md` | Tailored cover letters (27+) |
-| `Job Search Tracker - Mike Sapp 2026.md` | Master tracker |
-| `modes/_profile.md` | Candidate narrative, constraints, skip list |
+| `*.md` and `*.docx` imported from a user's workspace | Personal source material — source of truth |
 | `config/profile.yml` | Identity, contact, targets |
 | `reports/*` | Evaluation reports |
 | `output/*` | Generated PDFs |
@@ -40,7 +35,6 @@ These files contain system logic, templates, and scripts. They can be updated to
 | `check-liveness.mjs` | Job posting liveness verification |
 | `merge-tracker.mjs` | Tracker merge utility |
 | `dedup-tracker.mjs` | Tracker dedup utility |
-| `CLAUDE.md` | Claude Code guidance (mode routing, ATS strategy) |
 | `DATA_CONTRACT.md` | This file |
 | `src/jobby/**` | Standalone Jobby package logic and migrations |
 | `tests/**` | Offline automated tests and fixtures |
@@ -65,6 +59,10 @@ takes an exclusive lock, creates and verifies a pre-upgrade snapshot, rehearses
 the migration on that snapshot, journals the live apply, and verifies integrity
 and schema equivalence. `jobby upgrade recover` restores the verified snapshot
 after an interrupted or failed apply.
+
+The names in older local workspaces are intentionally not part of the public
+fixture contract. Public source code refers to imported artifacts by stable IDs
+and provenance metadata, never by a person's name or absolute path.
 
 Provenance is append-only by default. Exact redundant evaluations are removed
 only by the explicit `jobby maintenance compact-evaluations --apply` workflow,

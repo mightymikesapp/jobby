@@ -73,7 +73,7 @@ def test_disabled_provider_rejects_even_an_injected_client_without_calls() -> No
 
     client = MagicMock()
     secrets = MagicMock()
-    secrets.get.return_value = "sk-present-but-disabled"
+    secrets.get.return_value = "fixture-key-present-but-disabled"
 
     with pytest.raises(ProviderUnavailable, match="OpenAI is disabled"):
         OpenAIProvider(AppConfig(), secret_store=secrets, client=client)

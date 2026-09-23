@@ -1,0 +1,5 @@
+# Keep release, security, and data-boundary changes visible to the owner.
+* @mightymikesapp
+.github/ @mightymikesapp
+SECURITY.md @mightymikesapp
+DATA_CONTRACT.md @mightymikesapp

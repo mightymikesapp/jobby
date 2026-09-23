@@ -985,7 +985,7 @@ def test_doctor_never_constructs_openai_when_disabled_even_with_key(
         database,
         AppConfig(openai_enabled=False),
         paths,
-        secrets=MappingSecrets({"openai_api_key": "sk-present-but-disabled"}),
+        secrets=MappingSecrets({"openai_api_key": "fixture-key-present-but-disabled"}),
         check_network=True,
     )
 
@@ -1011,7 +1011,7 @@ def test_doctor_fails_inconsistent_scheduled_web_without_probing_openai(
         database,
         AppConfig(openai_enabled=False, scheduled_web_enabled=True),
         paths,
-        secrets=MappingSecrets({"openai_api_key": "sk-present-but-disabled"}),
+        secrets=MappingSecrets({"openai_api_key": "fixture-key-present-but-disabled"}),
         check_network=True,
     )
 
@@ -1225,7 +1225,7 @@ def test_agent_explicit_web_request_still_makes_zero_openai_calls_when_disabled(
     run = DailyAgent(
         database,
         AppConfig(openai_enabled=False, notifications_enabled=False),
-        secrets=MappingSecrets({"openai_api_key": "sk-present-but-disabled"}),
+        secrets=MappingSecrets({"openai_api_key": "fixture-key-present-but-disabled"}),
     ).run(include_web=True)
 
     assert run.status is AgentRunStatus.SUCCEEDED
