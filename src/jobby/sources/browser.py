@@ -6,7 +6,8 @@ import hashlib
 import re
 import socket
 import ssl
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -50,6 +51,32 @@ DEFAULT_TITLE_TERMS = (
     "safety",
 )
 
+_HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
+# Job-shaped URL paths (``/jobs/123``, ``/careers/...``, ``/requisition-9``).
+JOB_PATH = re.compile(
+    r"(?:^|/)(?:jobs?|careers?|positions?|openings?|vacanc(?:y|ies)|requisitions?|"
+    r"postings?|opportunit(?:y|ies))(?:/|-|_|$)",
+    re.I,
+)
+# Site-chrome pages whose link text often contains a title term ("Legal",
+# "Privacy Policy", "Copyright Notices") but which are never postings.
+_BOILERPLATE_PATH = re.compile(
+    r"privacy|cookie|terms|legal|disclaimer|accessibility|copyright|notices?|"
+    r"imprint|gdpr|ccpa|do-not-sell",
+    re.I,
+)
+# Footer link text that names a policy page wherever it is hosted.
+_BOILERPLATE_TITLE = re.compile(
+    r"(?:©.*|copyright ©.*|legal|legal notices?|privacy|privacy (?:policy|notice|statement)|"
+    r"cookie (?:policy|settings|preferences)|terms(?: of (?:use|service))?|"
+    r"terms (?:and|&) conditions|accessibility(?: statement)?|do not sell.*|"
+    r"equal (?:employment )?opportunity.*|eeo(?: policy| statement)?)",
+    re.I,
+)
+# Link text naming a collection of roles ("Paralegal & Staff Openings").
+LISTING_TITLE = re.compile(
+    r"\b(?:openings|positions|opportunities|jobs|careers|vacancies|roles)\s*$", re.I
+)
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REDIRECTS = 5
 _MAX_RESPONSE_BYTES = 2_000_000
@@ -265,50 +292,8 @@ class PublicPortalSource(JobSource):
             html_text, final_url, http_status = self._fetch_html()
         except InterruptedError:
             raise
-        except _PortalFailure as exc:
-            return self._failed(
-                started,
-                exc.code,
-                exc.message,
-                exc.http_status,
-                retryable=exc.retryable,
-                retry_after_seconds=exc.retry_after_seconds,
-            )
-        except httpx.TimeoutException:
-            return self._failed(
-                started,
-                "timeout",
-                "The public portal request timed out.",
-                retryable=True,
-            )
-        except SourceDeadlineExceeded:
-            return self._failed(
-                started,
-                "source_deadline",
-                "The public portal source deadline expired.",
-            )
-        except httpx.HTTPError as exc:
-            message = str(exc) or exc.__class__.__name__
-            code = (
-                "unsafe_target"
-                if "unsafe resolved address" in message
-                else "network_error"
-            )
-            return self._failed(started, code, message)
-        except OSError as exc:
-            message = str(exc) or exc.__class__.__name__
-            code = (
-                "unsafe_target"
-                if "unsafe resolved address" in message
-                else "network_error"
-            )
-            return self._failed(started, code, message)
         except Exception as exc:
-            return self._failed(
-                started,
-                "parse_error",
-                str(exc) or exc.__class__.__name__,
-            )
+            return self._fetch_failure(started, exc)
 
         parser = _PublicAnchorParser()
         try:
@@ -316,56 +301,14 @@ class PublicPortalSource(JobSource):
             parser.close()
         except Exception as exc:
             return self._failed(started, "malformed_html", str(exc))
-        body = re.sub(r"\s+", " ", " ".join(parser.text_parts))
-        if re.search(
-            r"\b(captcha|verify you are human|access denied|sign in to continue)\b",
-            body,
-            re.IGNORECASE,
-        ):
+        if _is_restricted(parser.text_parts):
             return self._failed(
                 started,
                 "restricted_page",
                 "The public page requires authentication or a challenge; Jobby will not bypass it.",
             )
 
-        terms = tuple(term.casefold() for term in self.config.title_terms)
-        query_terms = tuple(
-            re.findall(r"[\w+#.-]+", str(query or "")[:2_000].casefold())[:100]
-        )
-        seen: set[str] = set()
-        items: list[ScanItem] = []
-        for anchor in parser.anchors:
-            title = re.sub(r"\s+", " ", anchor["text"]).strip()
-            url = anchor["href"].strip()
-            if len(title) < 3 or len(title) > 240 or not url:
-                continue
-            folded = title.casefold()
-            if query_terms:
-                if not all(term in folded for term in query_terms):
-                    continue
-            elif not any(term in folded for term in terms):
-                continue
-            launch_url = urljoin(final_url, url)
-            canonical = normalize_url(launch_url)
-            if not canonical or not is_public_http_url(canonical):
-                continue
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            items.append(
-                ScanItem(
-                    source=self.source_key,
-                    source_id=hashlib.sha256(canonical.encode()).hexdigest()[:24],
-                    company=self.config.name,
-                    title=title,
-                    url=launch_url,
-                    metadata={
-                        "extraction": "static_html_anchor",
-                        "portal_url": self.config.url,
-                        "final_url": final_url,
-                    },
-                )
-            )
+        items = self._anchor_items(parser.anchors, final_url, query)
         return SourceResult(
             source=self.source_key,
             status=ScanStatus.SUCCEEDED,
@@ -381,6 +324,106 @@ class PublicPortalSource(JobSource):
             },
         )
 
+    def _title_matches(self, title: str, query: str | None) -> bool:
+        """Apply the portal title filter, or all explicit query terms instead."""
+
+        folded = title.casefold()
+        query_terms = tuple(
+            re.findall(r"[\w+#.-]+", str(query or "")[:2_000].casefold())[:100]
+        )
+        if query_terms:
+            return all(term in folded for term in query_terms)
+        return any(term.casefold() in folded for term in self.config.title_terms)
+
+    def _anchor_items(
+        self,
+        anchors: Iterable[Mapping[str, str]],
+        page_url: str,
+        query: str | None,
+    ) -> list[ScanItem]:
+        seen: set[str] = set()
+        items: list[ScanItem] = []
+        for anchor in anchors:
+            title = re.sub(r"\s+", " ", anchor["text"]).strip()
+            url = anchor["href"].strip()
+            if len(title) < 3 or len(title) > 240 or not url:
+                continue
+            if (
+                not self._title_matches(title, query)
+                or LISTING_TITLE.search(title)
+                or _BOILERPLATE_TITLE.fullmatch(title)
+            ):
+                continue
+            launch_url = urljoin(page_url, url)
+            path = urlsplit(launch_url).path
+            if _BOILERPLATE_PATH.search(path) and not JOB_PATH.search(path):
+                continue
+            canonical = normalize_url(launch_url)
+            # ``mailto:x@host`` normalizes to a public URL; check the real link.
+            if (
+                not canonical
+                or not is_public_http_url(canonical)
+                or not is_public_http_url(launch_url)
+            ):
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            items.append(
+                ScanItem(
+                    source=self.source_key,
+                    source_id=hashlib.sha256(canonical.encode()).hexdigest()[:24],
+                    company=self.config.name,
+                    title=title,
+                    url=launch_url,
+                    metadata={
+                        "extraction": "static_html_anchor",
+                        "portal_url": self.config.url,
+                        "final_url": page_url,
+                    },
+                )
+            )
+        return items
+
+    def _fetch_failure(self, started: datetime, exc: Exception) -> SourceResult:
+        """Convert a fetch exception into persisted failure data."""
+
+        if isinstance(exc, _PortalFailure):
+            return self._failed(
+                started,
+                exc.code,
+                exc.message,
+                exc.http_status,
+                retryable=exc.retryable,
+                retry_after_seconds=exc.retry_after_seconds,
+            )
+        if isinstance(exc, httpx.TimeoutException):
+            return self._failed(
+                started,
+                "timeout",
+                "The public portal request timed out.",
+                retryable=True,
+            )
+        if isinstance(exc, SourceDeadlineExceeded):
+            return self._failed(
+                started,
+                "source_deadline",
+                "The public portal source deadline expired.",
+            )
+        if isinstance(exc, (httpx.HTTPError, OSError)):
+            message = str(exc) or exc.__class__.__name__
+            code = (
+                "unsafe_target"
+                if "unsafe resolved address" in message
+                else "network_error"
+            )
+            return self._failed(started, code, message)
+        return self._failed(
+            started,
+            "parse_error",
+            str(exc) or exc.__class__.__name__,
+        )
+
     def hydrate(self, item: ScanItem) -> ScanItem:
         """Fetch one static public detail page without JavaScript or auth."""
 
@@ -390,11 +433,7 @@ class PublicPortalSource(JobSource):
         parser.feed(html_text)
         parser.close()
         body = re.sub(r"\s+", " ", " ".join(parser.text_parts)).strip()
-        if re.search(
-            r"\b(captcha|verify you are human|access denied|sign in to continue)\b",
-            body,
-            re.IGNORECASE,
-        ):
+        if _is_restricted(parser.text_parts):
             raise ValueError(
                 "The detail page requires authentication or a challenge; Jobby will not bypass it."
             )
@@ -412,7 +451,26 @@ class PublicPortalSource(JobSource):
         )
 
     def _fetch_html(self, start_url: str | None = None) -> tuple[str, str, int]:
-        current_url = start_url or self.config.url
+        return self._fetch_document(start_url or self.config.url)
+
+    def _fetch_document(
+        self,
+        start_url: str,
+        *,
+        content_types: tuple[str, ...] | None = _HTML_CONTENT_TYPES,
+        max_bytes: int = _MAX_RESPONSE_BYTES,
+        truncate: bool = False,
+        client: httpx.Client | None = None,
+        accept: str | None = None,
+    ) -> tuple[str, str, int]:
+        """Fetch one public document with revalidated redirects and a byte cap.
+
+        ``content_types=None`` accepts any declared type (robots.txt, sitemaps).
+        ``truncate=True`` keeps the first ``max_bytes`` instead of failing, for
+        documents such as sitemaps whose useful prefix is still parseable.
+        """
+
+        current_url = start_url
         visited: set[str] = set()
         self.checkpoint()
         initial_addresses, initial_error = _resolve_public_target(
@@ -429,15 +487,20 @@ class PublicPortalSource(JobSource):
                 initial_error or "portal host did not resolve to a public address",
             )
         self.checkpoint()
-        with self._client_factory() as client:
+        limit = min(max_bytes, self.max_response_bytes)
+        with (
+            nullcontext(client) if client is not None else self._client_factory()
+        ) as client:
             for redirect_index in range(_MAX_REDIRECTS + 1):
                 self.checkpoint()
-                canonical = normalize_url(current_url)
-                if not canonical or canonical in visited:
+                # Compare exact URLs: canonical forms drop the scheme, ``www.``
+                # and trailing-slash differences that ordinary redirects fix.
+                visit_key = current_url.split("#", 1)[0]
+                if not normalize_url(current_url) or visit_key in visited:
                     raise _PortalFailure(
                         "redirect_loop", "Portal redirect loop blocked."
                     )
-                visited.add(canonical)
+                visited.add(visit_key)
                 addresses, error = _resolve_public_target(
                     current_url, self._host_resolver
                 )
@@ -454,6 +517,7 @@ class PublicPortalSource(JobSource):
                 with client.stream(
                     "GET",
                     current_url,
+                    headers={"Accept": accept} if accept else None,
                     timeout=self.request_timeout(self.config.timeout_ms / 1_000),
                 ) as response:
                     if response.status_code in _REDIRECT_STATUSES:
@@ -490,21 +554,22 @@ class PublicPortalSource(JobSource):
                             ),
                         )
                     content_type = response.headers.get("content-type", "").casefold()
-                    if content_type and not (
-                        "text/html" in content_type
-                        or "application/xhtml+xml" in content_type
+                    if (
+                        content_types is not None
+                        and content_type
+                        and not any(kind in content_type for kind in content_types)
                     ):
                         raise _PortalFailure(
                             "unsupported_content",
-                            "Portal response is not HTML.",
+                            "Portal response is not HTML."
+                            if content_types == _HTML_CONTENT_TYPES
+                            else "Portal response has an unsupported content type.",
                             response.status_code,
                         )
                     content_length = response.headers.get("content-length")
-                    if content_length:
+                    if content_length and not truncate:
                         try:
-                            too_large = int(content_length) > min(
-                                _MAX_RESPONSE_BYTES, self.max_response_bytes
-                            )
+                            too_large = int(content_length) > limit
                         except ValueError:
                             too_large = False
                         if too_large:
@@ -517,8 +582,12 @@ class PublicPortalSource(JobSource):
                     size = 0
                     for chunk in response.iter_bytes():
                         self.checkpoint()
+                        if truncate and size + len(chunk) > limit:
+                            chunks.append(chunk[: limit - size])
+                            size = limit
+                            break
                         size += len(chunk)
-                        if size > min(_MAX_RESPONSE_BYTES, self.max_response_bytes):
+                        if size > limit:
                             raise _PortalFailure(
                                 "response_too_large",
                                 "Portal HTML exceeds the 2 MB safety limit.",
@@ -576,6 +645,16 @@ class _PortalFailure(Exception):
         self.http_status = http_status
         self.retryable = retryable
         self.retry_after_seconds = retry_after_seconds
+
+
+_RESTRICTED_PAGE = re.compile(
+    r"\b(captcha|verify you are human|access denied|sign in to continue)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_restricted(text_parts: Iterable[str]) -> bool:
+    return bool(_RESTRICTED_PAGE.search(re.sub(r"\s+", " ", " ".join(text_parts))))
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
@@ -637,4 +716,10 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
 
 
-__all__ = ["PinnedPublicHTTPTransport", "PortalConfig", "PublicPortalSource"]
+__all__ = [
+    "JOB_PATH",
+    "LISTING_TITLE",
+    "PinnedPublicHTTPTransport",
+    "PortalConfig",
+    "PublicPortalSource",
+]

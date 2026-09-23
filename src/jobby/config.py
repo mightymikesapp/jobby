@@ -483,6 +483,15 @@ class AppConfig(BaseModel):
     source_record_cap: int = Field(default=5_000, ge=100, le=100_000, strict=True)
     source_anomaly_ratio: float = Field(default=0.5, gt=0, le=1, allow_inf_nan=False)
     source_anomaly_window: int = Field(default=5, ge=3, le=20, strict=True)
+    # Configured career portals are crawled within this per-portal page budget;
+    # 1 reads only the configured page, as Jobby did before crawling existed.
+    portal_crawl_max_pages: int = Field(default=20, ge=1, le=200, strict=True)
+    # Pages of 20 postings read per Workday board on daily and manual scans.
+    # Weekly inventory scans read up to ``source_record_cap`` regardless.
+    workday_scan_max_pages: int = Field(default=100, ge=1, le=250, strict=True)
+    portal_crawl_delay_seconds: float = Field(
+        default=1.0, ge=0, le=30, allow_inf_nan=False
+    )
     ai_cache_ttl_days: int = Field(default=30, ge=1, le=365, strict=True)
     backup_daily_retention: int = Field(default=7, ge=1, le=365, strict=True)
     backup_weekly_retention: int = Field(default=4, ge=1, le=104, strict=True)

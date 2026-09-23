@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import re
 import socket
+from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy import select
@@ -16,12 +17,9 @@ from .models import ScanRun, SourceConfig
 from .openai_provider import OpenAIProvider
 from .ranking import ranking_profile_from_database
 from .scanner import Scanner, build_configured_sources
-from .sources.base import JobSource
-from .sources.browser import (
-    PinnedPublicHTTPTransport,
-    PortalConfig,
-    PublicPortalSource,
-)
+from .sources.base import JobSource, bounded_source_key
+from .sources.browser import PinnedPublicHTTPTransport, PortalConfig
+from .sources.crawler import CareerCrawlerSource, CrawlLimits
 
 
 MAX_MANUAL_QUERY_CHARS = 2_000
@@ -155,7 +153,7 @@ def run_discovery_scan(
         )
     scanner = _scanner(database, config)
     if selector == "portals" or selector.startswith(("portal:", "portal-id:")):
-        sources = _portal_sources(database, selector)
+        sources = _portal_sources(database, selector, config)
         if not sources:
             raise ValueError("no matching imported portal configuration")
         return scanner.scan(
@@ -210,7 +208,9 @@ def _scanner(database: Database, config: AppConfig) -> Scanner:
     return scanner
 
 
-def _portal_sources(database: Database, selector: str) -> Sequence[JobSource]:
+def _portal_sources(
+    database: Database, selector: str, config: AppConfig
+) -> Sequence[JobSource]:
     portal_id = selector.split(":", 1)[1] if selector.startswith("portal-id:") else None
     target = (
         selector.split(":", 1)[1].casefold() if selector.startswith("portal:") else None
@@ -223,6 +223,12 @@ def _portal_sources(database: Database, selector: str) -> Sequence[JobSource]:
         if portal_id:
             statement = statement.where(SourceConfig.id == portal_id)
         configs = list(session.scalars(statement.order_by(SourceConfig.name)))
+    limits = CrawlLimits(
+        max_pages=config.portal_crawl_max_pages,
+        request_delay_seconds=config.portal_crawl_delay_seconds,
+    )
+    # Boards already scanned directly need no second read through a portal.
+    configured_boards = _configured_board_keys(config)
     result: list[JobSource] = []
     for source_config in configs:
         if target and target not in {
@@ -233,9 +239,42 @@ def _portal_sources(database: Database, selector: str) -> Sequence[JobSource]:
         url = str(source_config.config_json.get("careers_url") or "").strip()
         if url:
             result.append(
-                PublicPortalSource(PortalConfig(name=source_config.name, url=url))
+                CareerCrawlerSource(
+                    PortalConfig(name=source_config.name, url=url),
+                    limits=limits,
+                    skip_delegate_keys=configured_boards,
+                )
             )
     return result
+
+
+def _configured_board_keys(config: AppConfig) -> frozenset[str]:
+    sources = config.sources
+    keys = {
+        bounded_source_key(provider, key)
+        for provider, boards in (
+            ("greenhouse", sources.greenhouse),
+            ("lever", sources.lever),
+            ("ashby", sources.ashby),
+            ("workable", sources.workable),
+        )
+        for key in boards
+    }
+    keys.update(
+        bounded_source_key("workday", f"{board.tenant}:{board.site}")
+        for board in sources.workday.values()
+    )
+    keys.update(
+        bounded_source_key("smartrecruiters", board.company_slug)
+        for board in sources.smartrecruiters.values()
+    )
+    keys.update(
+        bounded_source_key(
+            "icims", (urlsplit(board.base_url).hostname or "").rstrip(".").casefold()
+        )
+        for board in sources.icims.values()
+    )
+    return frozenset(keys)
 
 
 def _slug(value: str) -> str:

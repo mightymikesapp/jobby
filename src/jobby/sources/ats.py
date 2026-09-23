@@ -11,11 +11,20 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
+from html import unescape as html_unescape
 from html.parser import HTMLParser
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    quote,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 import httpx
 
@@ -345,6 +354,99 @@ def _listing_anchors(
     return records
 
 
+_ICIMS_TOP_REDIRECT = re.compile(
+    r"window\.top\.location\.href\s*=\s*['\"]([^'\"]{1,2000})['\"]"
+)
+_ICIMS_CARD = re.compile(r"<li[^>]*\biCIMS_JobCardItem\b[^>]*>", re.I)
+_ICIMS_ANCHOR = re.compile(r"<a\b[^>]*\biCIMS_Anchor\b[^>]*>", re.I)
+_ICIMS_FIELD = re.compile(
+    r"<dt[^>]*>(?P<label>.*?)</dt>\s*<dd[^>]*>(?P<value>.*?)</dd>", re.I | re.S
+)
+_ICIMS_H3 = re.compile(r"<h3[^>]*>(?P<title>.*?)</h3>", re.I | re.S)
+_ICIMS_DESCRIPTION = re.compile(
+    r"<div[^>]*\bdescription\b[^>]*>(?P<text>.*?)</div>", re.I | re.S
+)
+
+
+def _attribute(tag: str, name: str) -> str:
+    match = re.search(rf"\b{name}\s*=\s*(\"[^\"]*\"|'[^']*')", tag, re.I)
+    return html_unescape(match.group(1)[1:-1]) if match else ""
+
+
+def _without_iframe_flag(url: str) -> str:
+    parts = urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.casefold() != "in_iframe"
+    ]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def _icims_job_cards(html_text: str, *, base_url: str) -> list[dict[str, Any]]:
+    """Read the job cards of an iCIMS iframe listing page."""
+
+    expected_host = (urlsplit(base_url).hostname or "").casefold()
+    starts = [match.start() for match in _ICIMS_CARD.finditer(html_text)]
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, start in enumerate(starts[:1_000]):
+        end = starts[index + 1] if index + 1 < len(starts) else len(html_text)
+        card = html_text[start : min(end, start + 50_000)]
+        anchor = _ICIMS_ANCHOR.search(card)
+        if not anchor:
+            continue
+        absolute = _without_iframe_flag(
+            urljoin(base_url, _attribute(anchor.group(0), "href"))
+        )
+        parsed = urlsplit(absolute)
+        match = re.search(r"/jobs/(?P<id>\d+)(?:/|$)", parsed.path)
+        if (
+            not match
+            or parsed.scheme.casefold() != "https"
+            or (parsed.hostname or "").casefold() != expected_host
+        ):
+            continue
+        source_id = match.group("id")
+        heading = _ICIMS_H3.search(card)
+        title = _html_text(heading.group("title")) if heading else ""
+        if not title:
+            title = re.sub(r"^\s*\d+\s*-\s*", "", _attribute(anchor.group(0), "title"))
+        if not title or source_id in seen:
+            continue
+        seen.add(source_id)
+        fields: dict[str, str] = {}
+        for field in _ICIMS_FIELD.finditer(card):
+            label = _html_text(field.group("label")).split(":")[0].strip().casefold()
+            value = _html_text(field.group("value"))
+            if label and value and label not in fields:
+                fields[label] = value
+        locations = [
+            fields.get("location", ""),
+            fields.get("additional location(s)", ""),
+        ]
+        low = fields.get("posted min pay rate", "")
+        high = fields.get("posted max pay rate", "")
+        description = _ICIMS_DESCRIPTION.search(card)
+        records.append(
+            {
+                "id": source_id,
+                "title": title,
+                "url": absolute,
+                "location": " | ".join(item for item in locations if item),
+                "description": _html_text(description.group("text"))
+                if description
+                else "",
+                "salary_text": " - ".join(item for item in (low, high) if item),
+                "work_arrangement": fields.get("work arrangement", ""),
+                "department": fields.get("department", ""),
+                "position_type": fields.get("position type", ""),
+                "requisition": fields.get("job id", ""),
+            }
+        )
+    return records
+
+
 class GreenhouseSource(StructuredJobSource):
     name = "greenhouse"
 
@@ -517,14 +619,16 @@ class AshbySource(StructuredJobSource):
     def _fetch_records(
         self, query: str | None
     ) -> tuple[list[object], Mapping[str, Any]]:
+        # The public posting API is the board path itself; ``/jobs`` is 401.
         endpoint = (
             "https://api.ashbyhq.com/posting-api/job-board/"
-            f"{quote(self.board, safe='')}/jobs"
+            f"{quote(self.board, safe='')}"
         )
         data = _request_json(
             self.client,
             "GET",
             endpoint,
+            params={"includeCompensation": "true"},
             max_bytes=self.max_response_bytes,
             checkpoint=self.checkpoint,
             timeout=self.request_timeout(),
@@ -535,7 +639,13 @@ class AshbySource(StructuredJobSource):
 
     def _parse_record(self, record: Mapping[str, Any], index: int) -> ScanItem:
         location = _location(record.get("location"))
-        salary_value = record.get("compensationTierSummary") or record.get("salary")
+        compensation = _mapping(record.get("compensation"))
+        salary_value = (
+            compensation.get("scrapeableCompensationSalarySummary")
+            or compensation.get("compensationTierSummary")
+            or record.get("compensationTierSummary")
+            or record.get("salary")
+        )
         salary_text = _salary_text(salary_value)
         return ScanItem(
             source=self.source_key,
@@ -873,10 +983,13 @@ class ICIMSSource(StructuredJobSource):
         page_error: SourceError | None = None
         completed = False
         for page in range(self.max_pages):
+            # The standard portal page only frames the listing; ``in_iframe=1``
+            # returns the job cards themselves.
             params: dict[str, Any] = {
                 "ss": 1,
                 "searchRelation": "keyword_all",
                 "pr": page,
+                "in_iframe": 1,
             }
             if query:
                 params["searchKeyword"] = query
@@ -897,9 +1010,20 @@ class ICIMSSource(StructuredJobSource):
                     raise
                 page_error = source_error_from_exception(exc)
                 break
-            page_records = _listing_anchors(
-                html_text, base_url=page_url, provider="icims"
-            )
+            page_records = _icims_job_cards(html_text, base_url=page_url)
+            if not page_records:
+                page_records = _listing_anchors(
+                    html_text, base_url=page_url, provider="icims"
+                )
+                for record in page_records:
+                    record["url"] = _without_iframe_flag(record["url"])
+            handoff = _ICIMS_TOP_REDIRECT.search(html_text)
+            if not page_records and handoff:
+                target = handoff.group(1).replace("\\/", "/")[:300]
+                raise ValueError(
+                    "iCIMS portal hands off to the employer's own career site "
+                    f"({target}); scan that site instead"
+                )
             body = _html_text(html_text).casefold()
             structurally_valid = (
                 "icims" in html_text.casefold()
@@ -945,15 +1069,25 @@ class ICIMSSource(StructuredJobSource):
         }
 
     def _parse_record(self, record: Mapping[str, Any], index: int) -> ScanItem:
+        location = _location(record.get("location"))
+        salary_text = str(record.get("salary_text") or "")
         return ScanItem(
             source=self.source_key,
             source_id=str(_required(record, "id")),
             company=self.company,
             title=str(_required(record, "title")),
             url=str(_required(record, "url")),
-            location=_location(record.get("location")),
+            location=location,
             description=str(record.get("description") or ""),
-            metadata={"extraction": "static_html"},
+            salary_text=salary_text,
+            salary=normalize_salary(salary_text) if salary_text else None,
+            remote=normalize_remote(record.get("work_arrangement"), location=location),
+            metadata={
+                "extraction": "static_html",
+                "department": record.get("department", ""),
+                "position_type": record.get("position_type", ""),
+                "requisition": record.get("requisition", ""),
+            },
         )
 
     def hydrate(self, item: ScanItem) -> ScanItem:
@@ -972,6 +1106,150 @@ class ICIMSSource(StructuredJobSource):
             item,
             description=description,
             metadata={**dict(item.metadata), "hydrated": True},
+        )
+
+
+class JibeSource(StructuredJobSource):
+    """iCIMS career sites built on Jibe, read through their public ``/api/jobs`` feed."""
+
+    name = "jibe"
+
+    def __init__(
+        self,
+        client: httpx.Client,
+        *,
+        base_url: str,
+        company: str,
+        jobs_path: str = "",
+        page_size: int = 100,
+        max_pages: int = 50,
+    ) -> None:
+        parsed = urlsplit(base_url.strip())
+        hostname = (parsed.hostname or "").rstrip(".").casefold()
+        if (
+            parsed.scheme.casefold() != "https"
+            or not hostname
+            or parsed.username
+            or parsed.password
+            or parsed.port is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or not is_public_http_url(f"https://{hostname}")
+        ):
+            raise ValueError("base_url must be a credential-free public HTTPS origin")
+        prefix = "/" + jobs_path.strip().strip("/") if jobs_path.strip("/ ") else ""
+        if not re.fullmatch(r"(?:/[A-Za-z0-9._-]{1,64}){0,4}", prefix):
+            raise ValueError("jobs_path must be a short path prefix such as /careers")
+        if not company.strip():
+            raise ValueError("company is required")
+        if not 1 <= page_size <= 100:
+            raise ValueError("page_size must be between 1 and 100")
+        if not 1 <= max_pages <= 200:
+            raise ValueError("max_pages must be between 1 and 200")
+        self.base_url = f"https://{hostname}"
+        self.jobs_path = prefix
+        self.company = company.strip()
+        self.page_size = page_size
+        self.max_pages = max_pages
+        super().__init__(
+            client,
+            source_key=bounded_source_key("jibe", hostname),
+            concurrency_key=hostname,
+        )
+
+    def _fetch_records(
+        self, query: str | None
+    ) -> tuple[list[object], Mapping[str, Any]]:
+        endpoint = f"{self.base_url}/api/jobs"
+        records: list[object] = []
+        total: int | None = None
+        for page in range(1, self.max_pages + 1):
+            self.checkpoint()
+            params: dict[str, Any] = {"page": page, "limit": self.page_size}
+            if query:
+                params["keywords"] = query
+            data = _request_json(
+                self.client,
+                "GET",
+                endpoint,
+                params=params,
+                max_bytes=self.max_response_bytes,
+                checkpoint=self.checkpoint,
+                timeout=self.request_timeout(),
+            )
+            if not isinstance(data, Mapping) or not isinstance(data.get("jobs"), list):
+                raise ValueError("Jibe response is missing jobs")
+            try:
+                total = int(data.get("totalCount"))
+            except (TypeError, ValueError):
+                total = None
+            page_jobs = [
+                entry.get("data") if isinstance(entry, Mapping) else None
+                for entry in data["jobs"]
+            ]
+            records.extend(page_jobs)
+            if not page_jobs or (total is not None and len(records) >= total):
+                break
+        truncated = total is None or len(records) < total
+        return records, {
+            "base_url": self.base_url,
+            "query": query or "",
+            "total": total,
+            "truncated": truncated,
+            "truncation_reason": (
+                "The Jibe feed reported more jobs than the page budget read."
+                if total is not None
+                else "The Jibe feed did not report a total job count."
+            ),
+        }
+
+    def _parse_record(self, record: Mapping[str, Any], index: int) -> ScanItem:
+        slug = str(record.get("slug") or _required(record, "req_id")).strip()
+        location = str(
+            record.get("full_location")
+            or record.get("location_name")
+            or record.get("short_location")
+            or ""
+        )
+        low = record.get("salary_min_value")
+        high = record.get("salary_max_value")
+        has_low = (
+            isinstance(low, (int, float)) and not isinstance(low, bool) and low > 0
+        )
+        has_high = (
+            isinstance(high, (int, float)) and not isinstance(high, bool) and high > 0
+        )
+        salary_text = ""
+        salary = None
+        if has_low:
+            salary_text = f"{low:,.0f}" + (f" - {high:,.0f}" if has_high else "")
+            salary = normalize_salary(low, high if has_high else None)
+        categories = record.get("categories")
+        return ScanItem(
+            source=self.source_key,
+            source_id=str(record.get("req_id") or slug),
+            company=self.company,
+            title=str(_required(record, "title")),
+            url=f"{self.base_url}{self.jobs_path}/jobs/{quote(slug, safe='')}",
+            location=location,
+            description=_html_text(str(record.get("description") or "")),
+            salary_text=salary_text,
+            salary=salary,
+            remote=normalize_remote(record.get("location_type"), location=location),
+            posted_at=_datetime(record.get("posted_date") or record.get("create_date")),
+            metadata={
+                "department": record.get("department") or "",
+                "employment_type": record.get("employment_type") or "",
+                "categories": [
+                    item.get("name")
+                    for item in categories[:10]
+                    if isinstance(item, Mapping) and item.get("name")
+                ]
+                if isinstance(categories, list)
+                else [],
+                "apply_url": record.get("apply_url") or "",
+            },
         )
 
 
@@ -1557,6 +1835,7 @@ __all__ = [
     "AshbySource",
     "GreenhouseSource",
     "ICIMSSource",
+    "JibeSource",
     "LeverSource",
     "SmartRecruitersSource",
     "TaleoSource",

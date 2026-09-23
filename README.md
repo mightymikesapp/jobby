@@ -105,6 +105,15 @@ public-address, and DNS-rebinding protections. Pages that require JavaScript,
 authentication, or a CAPTCHA are intentionally left for manual review; Jobby no
 longer installs or embeds Chromium.
 
+Each portal scan is a small same-site crawl (`jobby scan --source portals`). It
+reads schema.org `JobPosting` data, follows pagination and listing links, checks
+job-shaped sitemap URLs, and hands embedded Greenhouse, Lever, Ashby, Workable,
+Workday, SmartRecruiters, iCIMS, or Taleo boards to their API adapters. It obeys
+robots.txt for every page it finds on its own, waits between requests, and stays
+within `portal_crawl_max_pages` (default 20; `1` reads only the configured page)
+and `portal_crawl_delay_seconds` (default 1.0; a larger robots `Crawl-delay`
+wins, up to 10 seconds).
+
 ## Commands
 
 ```bash
@@ -281,7 +290,9 @@ the unsafe path-only import mode has been removed.
 ## Deliberate V1 boundaries
 
 - Public portal extraction reads bounded static HTML. JavaScript-only listings,
-  login walls, bot challenges, and CAPTCHAs are reported for manual review.
+  login walls, bot challenges, and CAPTCHAs are reported for manual review. The
+  portal crawler reaches such sites only through their sitemaps, embedded
+  structured data, or a recognized ATS board.
 - Workday is paginated and USAJobs supports an explicit `*` national location.
   If either provider reaches its configured safety cap, the scan is marked
   partial rather than presented as complete. USAJobs remains unavailable until

@@ -149,7 +149,8 @@ def test_lever_maps_salary_and_categories() -> None:
 
 def test_ashby_maps_remote_posting() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/posting-api/job-board/example/jobs"
+        assert request.url.path == "/posting-api/job-board/example"
+        assert request.url.params["includeCompensation"] == "true"
         return httpx.Response(
             200,
             request=request,
@@ -163,7 +164,10 @@ def test_ashby_maps_remote_posting() -> None:
                         "descriptionPlain": "Build legal workflows.",
                         "isRemote": True,
                         "publishedAt": "2026-07-09",
-                        "compensationTierSummary": "$90K - $110K annually",
+                        "compensation": {
+                            "compensationTierSummary": "$90K – $110K • Offers Equity",
+                            "scrapeableCompensationSalarySummary": "$90K - $110K annually",
+                        },
                     }
                 ]
             },

@@ -415,3 +415,27 @@ def test_google_oauth_rejects_web_client_configuration_before_authorizing() -> N
             ["https://www.googleapis.com/auth/gmail.readonly"],
             interactive=True,
         )
+
+
+def test_workday_page_budget_is_configurable_and_bounded_by_record_cap() -> None:
+    from jobby.scanner import build_configured_sources
+
+    config = AppConfig(workday_scan_max_pages=40, source_record_cap=600)
+    with httpx.Client() as client:
+        daily = build_configured_sources(config, client=client, selector="workday")
+        inventory = build_configured_sources(
+            config, client=client, selector="workday", inventory=True
+        )
+    assert daily and all(source.max_pages == 30 for source in daily)
+    assert inventory and all(source.max_pages == 30 for source in inventory)
+
+    config = AppConfig(workday_scan_max_pages=40)
+    with httpx.Client() as client:
+        daily = build_configured_sources(config, client=client, selector="workday")
+        inventory = build_configured_sources(
+            config, client=client, selector="workday", inventory=True
+        )
+    assert all(source.max_pages == 40 for source in daily)
+    assert all(source.max_pages == 250 for source in inventory)
+    with pytest.raises(ValidationError):
+        AppConfig(workday_scan_max_pages=0)

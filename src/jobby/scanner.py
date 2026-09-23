@@ -1479,10 +1479,9 @@ def build_configured_sources(
                     wd=board_value("wd", "wd1"),
                     site=board_value("site"),
                     company=board_value("name") or key,
-                    max_pages=(
-                        min(250, math.ceil(config.source_record_cap / 20))
-                        if inventory
-                        else 20
+                    max_pages=min(
+                        250 if inventory else config.workday_scan_max_pages,
+                        math.ceil(config.source_record_cap / 20),
                     ),
                 )
             )
