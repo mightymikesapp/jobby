@@ -36,7 +36,7 @@ dependencies = [
   "python-docx>=1.1,<2",
   "PyYAML>=6.0,<7",
   "reportlab>=4.2,<6",
-  "SQLAlchemy>=2.0.36,<3",
+  "SQLAlchemy>=2.0.54,<3",
   "tomli-w>=1.2,<2",
 ]
 
