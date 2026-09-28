@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "alembic>=1.15,<2",
-  "cryptography>=50,<51",
+  "cryptography>=50.0.1,<51",
   # Static portal extraction subclasses httpcore's sync backend to pin DNS at
   # connect time. Keep this internal API exact until that hook is public.
   "httpcore==1.0.9",
