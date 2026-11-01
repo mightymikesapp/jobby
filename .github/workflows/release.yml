@@ -58,7 +58,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/tests/offline_support
       - name: Retain exact scale report
         if: always() && matrix.os == 'macos-15' && matrix.python == '3.13'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: jobby-exact-scale-macos-arm64-python313
           if-no-files-found: error
@@ -102,7 +102,7 @@ jobs:
             --expected-version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - if: matrix.python == '3.13'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: jobby-${{ steps.package.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
           if-no-files-found: error
